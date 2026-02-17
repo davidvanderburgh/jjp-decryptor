@@ -1,0 +1,42 @@
+# Decrypted/extracted game data
+*_decrypted/
+extract_*/
+videos/
+temp_*/
+usb_stick/
+
+# Game ISOs and disk images
+full isos/
+*.iso
+*.img
+*.ext4
+*.raw
+
+# Compiled artifacts
+*.so
+stubs/
+
+# Development/exploration scripts (not part of the app)
+*.c
+fl_decrypted.txt
+make_stubs*.sh
+inspect_header*.py
+pcg_crack.py
+emulate_decrypt.py
+
+# Python
+__pycache__/
+*.pyc
+
+# Compiled binaries (no extension)
+extract_jcrypt
+extract_jcrypt2
+
+# Claude Code
+.claude/
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
