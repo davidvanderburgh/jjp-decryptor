@@ -14,14 +14,23 @@ JJP pinball machines store encrypted game assets (graphics, videos, audio) on th
 
 ## Supported Games
 
+Confirmed working:
+
 - Willy Wonka & the Chocolate Factory
 - Guns N' Roses
 - Elton John
 - The Hobbit
+
+Not yet tested:
+
+- Wizard of Oz
+- Dialed In
+- Toy Story
 - The Godfather
 - Avatar
+- Harry Potter
 
-Each game requires its own HASP USB dongle (the one that ships with that specific machine).
+Each game requires its own HASP USB dongle (the purple USB dongle attached to the motherboard in the game).
 
 ## Requirements
 
@@ -30,7 +39,7 @@ Each game requires its own HASP USB dongle (the one that ships with that specifi
 - **gcc** in WSL: `wsl -u root -- apt install gcc`
 - **usbipd-win**: Install from [github.com/dorssel/usbipd-win](https://github.com/dorssel/usbipd-win/releases)
 - **Sentinel HASP USB dongle** for the game you want to decrypt
-- **Game image**: Clonezilla ISO backup or raw ext4 filesystem image
+- **Game image**: Clonezilla ISO backup or raw ext4 filesystem image. Download "full installs" from https://marketing.jerseyjackpinball.com/downloads/
 - **Python 3.10+** (Windows): [python.org](https://www.python.org/downloads/)
 
 No additional Python packages are required (uses only the standard library).
