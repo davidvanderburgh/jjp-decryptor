@@ -32,6 +32,7 @@ class DecryptionPipeline:
         self.image_path = image_path
         self.output_path = output_path
         self.log = log_cb
+        self.log_link = lambda text, url: None  # optional; set by caller
         self.on_phase = phase_cb
         self.on_progress = progress_cb
         self.on_done = done_cb
@@ -501,6 +502,44 @@ class DecryptionPipeline:
 
     # --- Phase 3: Dongle ---
 
+    def _bind_dongle(self, usbipd):
+        """Ensure the HASP dongle is bound (shared) in usbipd.
+
+        Binding is required before attaching to WSL and must be done as
+        administrator. The binding persists across reboots but is lost if
+        the dongle moves to a different USB port.
+        """
+        # Check if already bound by looking at usbipd list output
+        rc, stdout, _ = self.wsl.run_win([usbipd, "list"], timeout=15)
+        if rc != 0:
+            return
+
+        # Find the line with our dongle and check if it's already shared/bound
+        # States: "Not shared", "Shared", "Attached" — must exclude "Not shared"
+        for line in stdout.split("\n"):
+            if config.HASP_VID_PID in line:
+                lower = line.lower()
+                if "not shared" in lower:
+                    break  # Needs binding
+                if "shared" in lower or "attached" in lower:
+                    self.log("Dongle already bound (shared).", "info")
+                    return
+                break
+
+        # Not bound — bind with admin elevation
+        self.log("Binding dongle for USB passthrough (requires admin)...", "info")
+        rc, _, stderr = self.wsl.run_win(
+            ["powershell", "-Command",
+             f"Start-Process '{usbipd}' -ArgumentList "
+             f"'bind --hardware-id {config.HASP_VID_PID}' "
+             f"-Verb RunAs -Wait"],
+            timeout=30,
+        )
+        if rc != 0 and stderr.strip():
+            self.log(f"Warning: usbipd bind returned: {stderr.strip()}", "info")
+        else:
+            self.log("Dongle bound successfully.", "success")
+
     def _phase_dongle(self):
         self.log("Checking for HASP dongle...", "info")
         usbipd = find_usbipd()
@@ -520,6 +559,9 @@ class DecryptionPipeline:
                 "Please plug in the correct dongle and try again.")
 
         self.log("Dongle detected on Windows. Attaching to WSL...", "info")
+
+        # Ensure dongle is bound (shared) — required when dongle moves to a new port
+        self._bind_dongle(usbipd)
 
         # Detach first to ensure clean state (previous run may have left it attached)
         self.wsl.run_win(
@@ -549,6 +591,18 @@ class DecryptionPipeline:
                         f"Failed to attach dongle to WSL (admin): {stderr2}")
             elif "already" in stderr.lower():
                 self.log("Dongle already attached to WSL.", "info")
+            elif "not shared" in stderr.lower() or "bind" in stderr.lower():
+                # Binding may have failed silently — retry bind + attach
+                self.log("Device not shared, retrying bind...", "info")
+                self._bind_dongle(usbipd)
+                time.sleep(1)
+                rc2, _, stderr2 = self.wsl.run_win(
+                    [usbipd, "attach", "--wsl", "--hardware-id", config.HASP_VID_PID],
+                    timeout=30,
+                )
+                if rc2 != 0:
+                    raise PipelineError("Dongle",
+                        f"Failed to attach dongle to WSL after bind: {stderr2}")
             else:
                 raise PipelineError("Dongle",
                     f"Failed to attach dongle to WSL: {stderr}")
@@ -590,6 +644,55 @@ class DecryptionPipeline:
 
         # Now start the HASP daemon (after USB device is confirmed visible)
         self._start_hasp_daemon(step, total_wait)
+
+    def _reattach_dongle(self):
+        """Detach and re-attach the HASP dongle to WSL, then restart the daemon.
+
+        Used during retries when the dongle session fails. The USB device
+        may have lost its connection to WSL, so we do the full cycle:
+        bind (if needed) → detach → attach → wait for lsusb → restart daemon.
+        """
+        self.log("Re-attaching dongle to WSL...", "info")
+        usbipd = find_usbipd()
+
+        # Ensure bound (may have moved to a different port)
+        self._bind_dongle(usbipd)
+
+        # Detach
+        self.wsl.run_win(
+            [usbipd, "detach", "--hardware-id", config.HASP_VID_PID],
+            timeout=10,
+        )
+        time.sleep(2)
+
+        # Attach
+        rc, stdout, stderr = self.wsl.run_win(
+            [usbipd, "attach", "--wsl", "--hardware-id", config.HASP_VID_PID],
+            timeout=30,
+        )
+        if rc != 0 and "already" not in stderr.lower():
+            self.log(f"Warning: usbipd attach returned: {stderr}", "error")
+
+        # Wait for device to appear in WSL
+        for i in range(config.USB_SETTLE_TIMEOUT):
+            time.sleep(1)
+            try:
+                self.wsl.run(
+                    f"lsusb 2>/dev/null | grep -q '{config.HASP_VID_PID}'",
+                    timeout=5,
+                )
+                self.log(f"Dongle visible in WSL (after {i + 1}s).", "success")
+                break
+            except WslError:
+                pass
+        else:
+            self.log("Warning: Dongle not visible in lsusb after re-attach.", "error")
+
+        # Extra settle time
+        time.sleep(2)
+
+        # Restart daemon
+        self._start_hasp_daemon()
 
     def _start_hasp_daemon(self, progress_step=0, progress_total=0):
         """Kill any existing HASP daemon and start a fresh one.
@@ -672,23 +775,37 @@ class DecryptionPipeline:
         self.log("Compiling decryptor...", "info")
         mp = self.mount_point
 
-        # Write C source via base64 to avoid shell escaping issues
-        # Compile in WSL host (gcc is NOT in the chroot), output to chroot's /tmp
-        b64 = base64.b64encode(DECRYPT_C_SOURCE.encode()).decode()
+        # Write C source to a temp file and copy into chroot.
+        # (base64 via echo exceeds Windows command-line length limit for large sources)
+        import tempfile, os
         try:
-            self.wsl.run(
-                f"echo '{b64}' | base64 -d > {mp}/tmp/jjp_decrypt.c",
-                timeout=15,
-            )
-        except WslError as e:
+            with tempfile.NamedTemporaryFile(
+                mode='w', suffix='.c', delete=False,
+                dir=os.environ.get('TEMP', os.environ.get('TMP', '.')),
+            ) as tf:
+                tf.write(DECRYPT_C_SOURCE)
+                tmp_win = tf.name
+            wsl_tmp = win_to_wsl(tmp_win)
+            self.wsl.run(f"cp '{wsl_tmp}' {mp}/tmp/jjp_decrypt.c", timeout=15)
+            os.unlink(tmp_win)
+        except (WslError, OSError) as e:
             raise PipelineError("Compile",
-                f"Failed to write C source: {e.output}") from e
+                f"Failed to write C source: {e}") from e
 
-        # Compile using WSL host gcc, output directly into chroot's /tmp
+        # Compile using WSL host gcc, but link against chroot's libc to
+        # avoid glibc version mismatch (host glibc may be newer than chroot's)
+        chroot_lib = f"{mp}/lib/x86_64-linux-gnu"
         try:
             self.wsl.run(
-                f"gcc -shared -fPIC -o {mp}/tmp/jjp_decrypt.so "
-                f"{mp}/tmp/jjp_decrypt.c -ldl -nostartfiles 2>&1",
+                f"gcc -c -fPIC -std=gnu11 -D_FORTIFY_SOURCE=0 -fno-stack-protector "
+                f"-o {mp}/tmp/jjp_decrypt.o {mp}/tmp/jjp_decrypt.c 2>&1",
+                timeout=config.COMPILE_TIMEOUT,
+            )
+            self.wsl.run(
+                f"LIBS='{chroot_lib}/libc.so.6'; "
+                f"[ -f '{chroot_lib}/libdl.so.2' ] && LIBS=\"$LIBS {chroot_lib}/libdl.so.2\"; "
+                f"gcc -shared -nostdlib "
+                f"-o {mp}/tmp/jjp_decrypt.so {mp}/tmp/jjp_decrypt.o $LIBS -lgcc 2>&1",
                 timeout=config.COMPILE_TIMEOUT,
             )
         except WslError as e:
@@ -865,16 +982,16 @@ class DecryptionPipeline:
                     raise PipelineError("Decrypt",
                         f"Game process failed.\nLast output:\n{combined}")
 
-            # If sentinel error and we have retries left, restart daemon and retry
+            # If sentinel error and we have retries left, re-attach dongle and retry
             if sentinel_error and attempt < max_retries - 1:
                 wait = retry_wait * (attempt + 1)
                 self.log(
-                    f"Sentinel key not found - restarting HASP daemon and retrying "
+                    f"Sentinel key not found - re-attaching dongle and retrying "
                     f"in {wait}s (attempt {attempt + 2}/{max_retries})...",
                     "info",
                 )
                 time.sleep(wait)
-                self._start_hasp_daemon()
+                self._reattach_dongle()
                 continue
 
             if sentinel_error:
@@ -1130,67 +1247,74 @@ class ModPipeline(DecryptionPipeline):
             self.on_phase(6)  # Encrypt
             self._phase_encrypt()
 
+            # Convert and Build ISO only when input is an ISO
+            if self._is_iso():
+                self.on_phase(7)  # Convert
+                self._phase_convert()
+                self._check_cancel()
+
+                self.on_phase(8)  # Build ISO
+                self._phase_build_iso()
+                self._check_cancel()
+
             self._succeeded = True
             self.on_phase(cleanup_phase)
             self._phase_cleanup()
 
-            # Move the image to the output folder if it's still in /tmp
-            import os
-            img_name = self._raw_img_path.rsplit("/", 1)[-1] if self._raw_img_path else "image"
-            wsl_out = win_to_wsl(self.assets_folder)
-            dest = f"{wsl_out}/{img_name}"
-            win_path = os.path.join(self.assets_folder, img_name)
+            if self._is_iso() and hasattr(self, '_output_iso_path'):
+                win_path = self._output_iso_path
+                self.log(f"Modified ISO ready at: {win_path}", "success")
+                self.on_done(True,
+                    f"Asset modification complete!\n"
+                    f"Modified ISO at:\n{win_path}")
 
-            if self._raw_img_path and self._raw_img_path != dest:
-                self.log("Moving modified image to output folder...", "info")
-                try:
-                    last_pct = -1
-                    for line in self.wsl.stream(
-                        f"rsync --info=progress2 --no-inc-recursive --remove-source-files "
-                        f"'{self._raw_img_path}' '{dest}'",
-                        timeout=config.COPY_TIMEOUT,
-                    ):
-                        self._check_cancel()
-                        m = re.search(r'(\d+)%', line)
-                        if m:
-                            pct = int(m.group(1))
-                            if pct > last_pct:
-                                last_pct = pct
-                                self.on_progress(pct, 100, line.strip())
-                    self.on_progress(100, 100, "Done")
-                except WslError as e:
-                    self.log(f"Warning: Could not move image to output: {e.output}", "info")
+                self.log("", "info")
+                self.log("=== Next Steps ===", "info")
+                self.log(
+                    "1. Write this ISO to a USB drive (see instructions below)\n"
+                    "   Rufus: select DD Image mode (NOT ISO mode)\n"
+                    "   Or use: balenaEtcher, Win32DiskImager, or dd\n"
+                    "2. Boot the pinball machine from USB\n"
+                    "3. Let Clonezilla restore the image to the machine",
+                    "info",
+                )
+                self.log_link(
+                    "JJP USB Update Instructions (PDF)",
+                    "https://marketing.jerseyjackpinball.com/general/install-full/"
+                    "JJP_USB_UPDATE_PC_instructions.pdf",
+                )
+            else:
+                # Fallback for non-ISO inputs: output the raw .img
+                import os
+                img_name = self._raw_img_path.rsplit("/", 1)[-1] if self._raw_img_path else "image"
+                wsl_out = win_to_wsl(self.assets_folder)
+                dest = f"{wsl_out}/{img_name}"
+                win_path = os.path.join(self.assets_folder, img_name)
 
-            self.log(f"Modified image ready at: {win_path}", "success")
-            self.on_done(True,
-                f"Asset modification complete!\n"
-                f"Modified image at:\n{win_path}")
+                if self._raw_img_path and self._raw_img_path != dest:
+                    self.log("Moving modified image to output folder...", "info")
+                    try:
+                        last_pct = -1
+                        for line in self.wsl.stream(
+                            f"rsync --info=progress2 --no-inc-recursive --remove-source-files "
+                            f"'{self._raw_img_path}' '{dest}'",
+                            timeout=config.COPY_TIMEOUT,
+                        ):
+                            self._check_cancel()
+                            m = re.search(r'(\d+)%', line)
+                            if m:
+                                pct = int(m.group(1))
+                                if pct > last_pct:
+                                    last_pct = pct
+                                    self.on_progress(pct, 100, line.strip())
+                        self.on_progress(100, 100, "Done")
+                    except WslError as e:
+                        self.log(f"Warning: Could not move image to output: {e.output}", "info")
 
-            # Log instructions for writing the image to USB
-            self.log("", "info")
-            self.log("=== Next Steps: Writing to USB ===", "info")
-            self.log(
-                "1. Write the modified .img file to a USB drive using a disk imaging tool.\n"
-                "   Use Win32 Disk Imager, balenaEtcher, or Rufus (dd mode).\n"
-                "   Select the .img file above and write it to your USB drive.\n"
-                "   WARNING: This will erase all data on the USB drive!",
-                "info",
-            )
-            self.log(
-                "2. Insert the USB drive into the pinball machine's USB port.",
-                "info",
-            )
-            self.log(
-                "3. Power on the machine. It will detect the USB drive and\n"
-                "   prompt you to install the update. Follow the on-screen\n"
-                "   instructions to complete the update.",
-                "info",
-            )
-            self.log(
-                "4. Once the update finishes, remove the USB drive and\n"
-                "   power-cycle the machine.",
-                "info",
-            )
+                self.log(f"Modified image ready at: {win_path}", "success")
+                self.on_done(True,
+                    f"Asset modification complete!\n"
+                    f"Modified image at:\n{win_path}")
 
         except PipelineError as e:
             self.log(str(e), "error")
@@ -1333,20 +1457,33 @@ class ModPipeline(DecryptionPipeline):
         self.log("Compiling encryptor...", "info")
         mp = self.mount_point
 
-        b64 = base64.b64encode(ENCRYPT_C_SOURCE.encode()).decode()
+        import tempfile, os
         try:
-            self.wsl.run(
-                f"echo '{b64}' | base64 -d > {mp}/tmp/jjp_encrypt.c",
-                timeout=15,
-            )
-        except WslError as e:
+            with tempfile.NamedTemporaryFile(
+                mode='w', suffix='.c', delete=False,
+                dir=os.environ.get('TEMP', os.environ.get('TMP', '.')),
+            ) as tf:
+                tf.write(ENCRYPT_C_SOURCE)
+                tmp_win = tf.name
+            wsl_tmp = win_to_wsl(tmp_win)
+            self.wsl.run(f"cp '{wsl_tmp}' {mp}/tmp/jjp_encrypt.c", timeout=15)
+            os.unlink(tmp_win)
+        except (WslError, OSError) as e:
             raise PipelineError("Compile",
-                f"Failed to write C source: {e.output}") from e
+                f"Failed to write C source: {e}") from e
 
+        chroot_lib = f"{mp}/lib/x86_64-linux-gnu"
         try:
             self.wsl.run(
-                f"gcc -shared -fPIC -o {mp}/tmp/jjp_encrypt.so "
-                f"{mp}/tmp/jjp_encrypt.c -ldl -nostartfiles 2>&1",
+                f"gcc -c -fPIC -std=gnu11 -D_FORTIFY_SOURCE=0 -fno-stack-protector "
+                f"-o {mp}/tmp/jjp_encrypt.o {mp}/tmp/jjp_encrypt.c 2>&1",
+                timeout=config.COMPILE_TIMEOUT,
+            )
+            self.wsl.run(
+                f"LIBS='{chroot_lib}/libc.so.6'; "
+                f"[ -f '{chroot_lib}/libdl.so.2' ] && LIBS=\"$LIBS {chroot_lib}/libdl.so.2\"; "
+                f"gcc -shared -nostdlib "
+                f"-o {mp}/tmp/jjp_encrypt.so {mp}/tmp/jjp_encrypt.o $LIBS -lgcc 2>&1",
                 timeout=config.COMPILE_TIMEOUT,
             )
         except WslError as e:
@@ -1486,6 +1623,13 @@ class ModPipeline(DecryptionPipeline):
                         level = "error"
                     elif "[VERIFY OK]" in line or "decrypted OK" in line:
                         level = "success"
+                    elif "fl.dat updated successfully" in line:
+                        level = "success"
+                    elif "fl.dat written" in line:
+                        level = "success"
+                    elif ("Could not re-encrypt fl.dat" in line
+                          or "WARNING" in line):
+                        level = "error"
                     self.log(line, level)
 
                     m = total_re.search(line)
@@ -1520,12 +1664,12 @@ class ModPipeline(DecryptionPipeline):
             if sentinel_error and attempt < max_retries - 1:
                 wait = retry_wait * (attempt + 1)
                 self.log(
-                    f"Sentinel key not found - retrying in {wait}s "
-                    f"(attempt {attempt + 2}/{max_retries})...",
+                    f"Sentinel key not found - re-attaching dongle and retrying "
+                    f"in {wait}s (attempt {attempt + 2}/{max_retries})...",
                     "info",
                 )
                 time.sleep(wait)
-                self._start_hasp_daemon()
+                self._reattach_dongle()
                 continue
 
             if sentinel_error:
@@ -1547,10 +1691,373 @@ class ModPipeline(DecryptionPipeline):
             summary += " successfully"
             self.log(summary, "success")
 
+    # --- Phase 7: Convert (raw ext4 → partclone) ---
+
+    def _phase_convert(self):
+        """Convert modified ext4 image to partclone format for Clonezilla ISO."""
+        self.log("Converting modified image to partclone format...", "info")
+
+        # The ext4 image must be unmounted before partclone can read it.
+        # Also run e2fsck to fix any metadata inconsistencies from the
+        # read-write mount + file modifications.
+        if self.mount_point:
+            self.log("Unmounting ext4 for conversion...", "info")
+            # Unmount bind mounts first (reverse order)
+            for target in reversed(self._bind_mounted):
+                try:
+                    self.wsl.run(
+                        f"umount -l '{self.mount_point}{target}' 2>/dev/null; true",
+                        timeout=10,
+                    )
+                except WslError:
+                    pass
+            self._bind_mounted = []
+            # Unmount the ext4
+            try:
+                self.wsl.run(
+                    f"umount '{self.mount_point}'", timeout=30)
+            except WslError:
+                self.wsl.run(
+                    f"umount -l '{self.mount_point}' 2>/dev/null; true",
+                    timeout=30,
+                )
+            try:
+                self.wsl.run(
+                    f"rmdir '{self.mount_point}' 2>/dev/null; true", timeout=5)
+            except WslError:
+                pass
+            self.mount_point = None
+
+        wsl_img = self._raw_img_path
+        self.log("Running e2fsck to repair filesystem metadata...", "info")
+        try:
+            for line in self.wsl.stream(
+                f"e2fsck -fy '{wsl_img}' 2>&1",
+                timeout=300,
+            ):
+                clean = line.strip()
+                if clean:
+                    self.log(f"  {clean}", "info")
+        except WslError:
+            pass  # e2fsck returns non-zero if it made repairs — that's fine
+
+        # Ensure required tools are available
+        self._ensure_iso_tools()
+
+        # Mount the original ISO if not already mounted (extract may have skipped it)
+        if not self._iso_mount:
+            wsl_iso = win_to_wsl(self.image_path)
+            tag = uuid.uuid4().hex[:8]
+            self._iso_mount = f"/tmp/jjp_iso_{tag}"
+            try:
+                self.wsl.run(f"mkdir -p {self._iso_mount}", timeout=10)
+                self.wsl.run(
+                    f"mount -o loop,ro '{wsl_iso}' {self._iso_mount}",
+                    timeout=config.MOUNT_TIMEOUT,
+                )
+            except WslError as e:
+                raise PipelineError("Convert",
+                    f"Failed to mount original ISO: {e.output}") from e
+
+        # Verify Clonezilla structure
+        partimag = f"{self._iso_mount}{config.PARTIMAG_PATH}"
+        part_prefix = f"{partimag}/{config.GAME_PARTITION}.ext4-ptcl-img.gz"
+        try:
+            parts_out = self.wsl.run(
+                f"ls -1 {part_prefix}.* 2>/dev/null | sort", timeout=10)
+        except WslError:
+            parts_out = ""
+        parts = [p.strip() for p in parts_out.strip().split("\n") if p.strip()]
+        if not parts:
+            raise PipelineError("Convert",
+                f"No partclone image for {config.GAME_PARTITION} found in ISO.")
+
+        # Determine split size from original files — use exact byte count
+        # to match the original chunk boundaries precisely.
+        # (JJP originals use 1,000,000,000 bytes, NOT 1 GiB.)
+        split_size = "1000000000"
+        try:
+            sz = self.wsl.run(
+                f"stat -c%s '{parts[0]}'", timeout=5).strip()
+            split_size = sz  # exact byte count from original first chunk
+        except (WslError, ValueError):
+            pass
+        self.log(f"Using split size: {split_size} bytes", "info")
+
+        # Prefer pigz (parallel gzip) for speed
+        try:
+            self.wsl.run("which pigz", timeout=5)
+            compressor = "pigz -c"
+        except WslError:
+            compressor = "gzip -c"
+
+        # Run the conversion pipeline — output to a temp chunks directory.
+        # The build phase will splice these into the original ISO.
+        tag = uuid.uuid4().hex[:8]
+        self._chunks_dir = f"/tmp/jjp_chunks_{tag}"
+        output_prefix = f"{self._chunks_dir}/{config.GAME_PARTITION}.ext4-ptcl-img.gz."
+        self.wsl.run(f"mkdir -p '{self._chunks_dir}'", timeout=10)
+
+        # The raw image may still be mounted — use the path directly
+        wsl_img = self._raw_img_path
+        self.log(f"Converting {wsl_img} to partclone format...", "info")
+        self.log("This may take 10-30 minutes depending on image size.", "info")
+
+        # Build a wrapper script that runs the conversion in the background
+        # and monitors progress from the partclone log file. This lets us
+        # stream progress updates to the GUI during the long-running conversion.
+        # Note: partclone writes progress with \r (carriage returns) to stderr,
+        # so we use tr to convert \r to \n for grep, and stdbuf to reduce
+        # buffering on the stderr redirect.
+        convert_cmd = (
+            f"set -o pipefail && "
+            f"partclone.ext4 -c -s '{wsl_img}' -o - 2> >(stdbuf -oL tr '\\r' '\\n' > /tmp/jjp_ptcl.log) "
+            f"| {compressor} "
+            f"| split -b {split_size} -a 2 - '{output_prefix}'"
+        )
+        monitor_script = (
+            f"#!/bin/bash\n"
+            f"# Run conversion in background\n"
+            f"({convert_cmd}) &\n"
+            f"PID=$!\n"
+            f"LAST_PCT=-1\n"
+            f"# Monitor progress from partclone log\n"
+            f"while kill -0 $PID 2>/dev/null; do\n"
+            f"  sleep 3\n"
+            f"  # Extract latest progress from partclone log\n"
+            f"  PCT=$(grep -oP 'Completed:\\s*\\K[\\d.]+' /tmp/jjp_ptcl.log 2>/dev/null | tail -1)\n"
+            f"  # Get output size\n"
+            f"  OSIZE=$(du -sb '{output_prefix}'* 2>/dev/null | awk '{{s+=$1}} END {{printf \"%d\", s}}')\n"
+            f"  if [ -n \"$PCT\" ]; then\n"
+            f"    # Only print if progress changed\n"
+            f"    CUR=$(printf '%.0f' \"$PCT\" 2>/dev/null || echo 0)\n"
+            f"    if [ \"$CUR\" != \"$LAST_PCT\" ]; then\n"
+            f"      LAST_PCT=$CUR\n"
+            f"      echo \"PROGRESS:${{PCT}}% output=${{OSIZE:-0}}\"\n"
+            f"    fi\n"
+            f"  else\n"
+            f"    # No progress yet — show indeterminate\n"
+            f"    echo \"PROGRESS:0% output=${{OSIZE:-0}}\"\n"
+            f"  fi\n"
+            f"done\n"
+            f"wait $PID\n"
+            f"exit $?\n"
+        )
+        monitor_path = "/tmp/jjp_convert_monitor.sh"
+        monitor_b64 = base64.b64encode(monitor_script.encode()).decode()
+        self.wsl.run(
+            f"echo '{monitor_b64}' | base64 -d > {monitor_path} && "
+            f"chmod +x {monitor_path}",
+            timeout=10,
+        )
+
+        self.log("Starting partclone conversion pipeline...", "info")
+        last_pct = -1
+        try:
+            for line in self.wsl.stream(
+                f"bash {monitor_path}", timeout=config.ISO_CONVERT_TIMEOUT
+            ):
+                if self.cancelled:
+                    self.wsl.kill()
+                    raise PipelineError("Convert", "Cancelled by user.")
+                clean = line.strip()
+                if not clean:
+                    continue
+                m = re.search(r'PROGRESS:([\d.]+)%\s*output=(\d+)', clean)
+                if m:
+                    pct = float(m.group(1))
+                    ipct = int(pct)
+                    out_mb = int(m.group(2)) / (1024**2)
+                    if ipct > last_pct:
+                        last_pct = ipct
+                        self.on_progress(ipct, 100, f"{ipct}% ({out_mb:.0f} MB written)")
+                        if ipct % 10 == 0:
+                            self.log(f"  Conversion: {ipct}% ({out_mb:.0f} MB written)", "info")
+
+        except WslError as e:
+            # Try to read the partclone log for details
+            log_content = ""
+            try:
+                log_content = self.wsl.run(
+                    "tail -5 /tmp/jjp_ptcl.log 2>/dev/null", timeout=5).strip()
+            except WslError:
+                pass
+            raise PipelineError("Convert",
+                f"Partclone conversion failed: {e.output}\n{log_content}") from e
+
+        # Verify output files
+        try:
+            parts_out = self.wsl.run(
+                f"ls -lh '{output_prefix}'* 2>/dev/null", timeout=10).strip()
+            self.log(f"Partclone files created:\n{parts_out}", "success")
+        except WslError:
+            raise PipelineError("Convert", "No partclone output files were created.")
+
+        self.on_progress(100, 100, "Conversion complete")
+
+    def _ensure_iso_tools(self):
+        """Ensure partclone and xorriso are available, installing if needed."""
+        for tool, pkg in [("partclone.ext4", "partclone"), ("xorriso", "xorriso")]:
+            try:
+                self.wsl.run(f"which {tool}", timeout=10)
+                self.log(f"  {tool}: found", "info")
+            except WslError:
+                self.log(f"  {tool} not found. Installing {pkg}...", "info")
+                try:
+                    self.wsl.run(
+                        f"DEBIAN_FRONTEND=noninteractive apt-get install -y {pkg} 2>&1",
+                        timeout=120,
+                    )
+                    self.log(f"  {pkg} installed.", "success")
+                except WslError as e:
+                    raise PipelineError("Convert",
+                        f"Failed to install {pkg}: {e.output}\n"
+                        f"Run manually: wsl -u root -- apt install {pkg}") from e
+
+    # --- Phase 8: Build ISO ---
+
+    def _phase_build_iso(self):
+        """Assemble modified Clonezilla ISO by splicing new partition chunks
+        into the original ISO.  Uses xorriso -indev/-outdev with
+        -boot_image any replay to perfectly preserve the original boot
+        configuration (MBR, El Torito, EFI, Syslinux)."""
+        import os
+        self.log("Building modified Clonezilla ISO...", "info")
+
+        iso_basename = os.path.splitext(os.path.basename(self.image_path))[0]
+        wsl_out = win_to_wsl(self.assets_folder)
+        output_iso = f"{wsl_out}/{iso_basename}_modified.iso"
+        wsl_iso = win_to_wsl(self.image_path)
+
+        # Enumerate new chunk files produced by _phase_convert
+        chunks_dir = self._chunks_dir
+        game_part = config.GAME_PARTITION
+        partimag = config.PARTIMAG_PATH
+        try:
+            chunks_out = self.wsl.run(
+                f"ls -1 '{chunks_dir}/{game_part}.ext4-ptcl-img.gz.'* "
+                f"2>/dev/null | sort",
+                timeout=10,
+            ).strip()
+        except WslError:
+            chunks_out = ""
+        new_chunks = [c.strip() for c in chunks_out.split("\n") if c.strip()]
+        if not new_chunks:
+            raise PipelineError("Build ISO", "No new partition chunks found.")
+        self.log(f"Found {len(new_chunks)} new partition chunk(s).", "info")
+
+        # Build xorriso command:
+        #   -indev  : read original ISO (preserves all structure)
+        #   -outdev : write modified ISO
+        #   -boot_image any replay : preserve ALL boot records from original
+        #   -find … -exec remove   : delete old partition chunks
+        #   -map …                 : add new partition chunks
+        rm_cmd = (
+            f"-find '{partimag}' "
+            f"-name '{game_part}.ext4-ptcl-img.gz.*' "
+            f"-exec rm --"
+        )
+
+        map_cmds = []
+        for chunk_path in new_chunks:
+            base = chunk_path.rsplit("/", 1)[-1]
+            iso_path = f"{partimag}/{base}"
+            map_cmds.append(f"-map '{chunk_path}' '{iso_path}'")
+
+        map_str = " \\\n  ".join(map_cmds)
+
+        script = (
+            f"#!/bin/bash\n"
+            f"set -e\n"
+            f"xorriso \\\n"
+            f"  -indev '{wsl_iso}' \\\n"
+            f"  -outdev '{output_iso}' \\\n"
+            f"  -boot_image any replay \\\n"
+            f"  {rm_cmd} \\\n"
+            f"  {map_str} \\\n"
+            f"  -end 2>&1\n"
+        )
+        script_path = "/tmp/jjp_build_iso.sh"
+        script_b64 = base64.b64encode(script.encode()).decode()
+        self.wsl.run(
+            f"echo '{script_b64}' | base64 -d > {script_path} && "
+            f"chmod +x {script_path}",
+            timeout=10,
+        )
+
+        # Unmount the original ISO before xorriso reads it — avoids
+        # contention between the loop mount and xorriso's file access.
+        if self._iso_mount:
+            try:
+                self.wsl.run(
+                    f"umount -l '{self._iso_mount}' 2>/dev/null; true", timeout=15)
+                self.wsl.run(
+                    f"rmdir '{self._iso_mount}' 2>/dev/null; true", timeout=5)
+            except WslError:
+                pass
+            self._iso_mount = None
+
+        # Remove existing output ISO — xorriso refuses to write to non-empty -outdev
+        try:
+            self.wsl.run(f"rm -f '{output_iso}'", timeout=10)
+        except WslError:
+            pass
+
+        self.log("Running xorriso (splicing partition into original ISO)...", "info")
+        last_pct = -1
+        try:
+            for line in self.wsl.stream(
+                f"bash {script_path}", timeout=config.ISO_BUILD_TIMEOUT
+            ):
+                self._check_cancel()
+                clean = line.strip()
+                if not clean:
+                    continue
+                if "FAILURE" in clean or "sorry" in clean.lower():
+                    self.log(f"  xorriso: {clean}", "error")
+                # xorriso native mode: "Writing:  1234s    12.3%"
+                m = re.search(r'(\d+\.\d+)%', clean)
+                if m:
+                    pct = int(float(m.group(1)))
+                    if pct > last_pct:
+                        last_pct = pct
+                        self.on_progress(pct, 100, f"Building ISO: {pct}%")
+        except WslError as e:
+            try:
+                script_content = self.wsl.run(
+                    f"cat {script_path}", timeout=5).strip()
+                self.log(f"Build script was:\n{script_content}", "info")
+            except WslError:
+                pass
+            raise PipelineError("Build ISO",
+                f"xorriso failed: {e.output}") from e
+
+        # Verify output and compare size with original
+        try:
+            new_sz = int(self.wsl.run(
+                f"stat -c%s '{output_iso}'", timeout=10).strip())
+            orig_sz = int(self.wsl.run(
+                f"stat -c%s '{wsl_iso}'", timeout=10).strip())
+            new_gb = new_sz / (1024**3)
+            orig_gb = orig_sz / (1024**3)
+            diff_mb = (new_sz - orig_sz) / (1024**2)
+            self.log(
+                f"ISO created: {new_gb:.2f} GB "
+                f"(original: {orig_gb:.2f} GB, diff: {diff_mb:+.1f} MB)",
+                "success",
+            )
+        except (WslError, ValueError):
+            raise PipelineError("Build ISO", "ISO file was not created.")
+
+        self.on_progress(100, 100, "ISO build complete")
+        win_iso_path = os.path.join(self.assets_folder, f"{iso_basename}_modified.iso")
+        self._output_iso_path = win_iso_path
+        self.log(f"Output ISO: {win_iso_path}", "success")
+
     # --- Cleanup ---
 
     def _phase_cleanup(self):
-        """Same as parent cleanup but never deletes the raw image."""
+        """Clean up mounts, build dir, and detach dongle."""
         self.log("Cleaning up...", "info")
 
         if self.mount_point:
@@ -1588,6 +2095,20 @@ class ModPipeline(DecryptionPipeline):
                 self.wsl.run(f"rmdir '{self._iso_mount}' 2>/dev/null; true", timeout=5)
             except WslError:
                 pass
+
+        # Clean up temp chunks directory
+        if hasattr(self, '_chunks_dir') and self._chunks_dir:
+            self.log("Removing temp chunks directory...", "info")
+            try:
+                self.wsl.run(f"rm -rf '{self._chunks_dir}'", timeout=60)
+            except WslError:
+                self.log(f"Warning: Could not remove {self._chunks_dir}", "info")
+
+        # Clean up partclone log
+        try:
+            self.wsl.run("rm -f /tmp/jjp_ptcl.log 2>/dev/null; true", timeout=5)
+        except WslError:
+            pass
 
         self.log("Cleanup complete.", "success")
 
@@ -1628,5 +2149,21 @@ def check_prerequisites(wsl):
     else:
         results.append(("HASP Dongle", False,
             "Sentinel HASP dongle not detected. Plug it in."))
+
+    # partclone (optional — auto-installed at runtime if missing)
+    try:
+        wsl.run("which partclone.ext4", timeout=10)
+        results.append(("partclone", True, "Available"))
+    except Exception:
+        results.append(("partclone", False,
+            "Not installed (will auto-install during Modify Assets)"))
+
+    # xorriso (optional — auto-installed at runtime if missing)
+    try:
+        wsl.run("which xorriso", timeout=10)
+        results.append(("xorriso", True, "Available"))
+    except Exception:
+        results.append(("xorriso", False,
+            "Not installed (will auto-install during Modify Assets)"))
 
     return results

@@ -38,6 +38,11 @@ class DoneMsg:
         self.success = success
         self.summary = summary
 
+class LinkMsg:
+    def __init__(self, text, url):
+        self.text = text
+        self.url = url
+
 class GameDetectedMsg:
     def __init__(self, name):
         self.name = name
@@ -53,6 +58,14 @@ class App:
         self.wsl = WslExecutor()
         self._active_mode = "decrypt"  # "decrypt" or "modify"
 
+        # Pre-load theme preference (needed before window creation)
+        saved_theme = None
+        try:
+            with open(_SETTINGS_FILE, "r") as f:
+                saved_theme = json.load(f).get("theme")
+        except Exception:
+            pass
+
         self.window = MainWindow(
             self.root,
             on_check_prereqs=self._check_prereqs,
@@ -61,6 +74,8 @@ class App:
             on_mod_apply=self._mod_start,
             on_mod_cancel=self._mod_cancel,
             on_clear_cache=self._clear_cache,
+            on_theme_change=self._on_theme_change,
+            initial_theme=saved_theme,
         )
 
         # Detect game name when file is selected (register before loading settings
@@ -137,6 +152,8 @@ class App:
                 msg = self.msg_queue.get_nowait()
                 if isinstance(msg, LogMsg):
                     self.window.append_log(msg.text, msg.level)
+                elif isinstance(msg, LinkMsg):
+                    self.window.append_log_link(msg.text, msg.url)
                 elif isinstance(msg, PhaseMsg):
                     self.window.set_phase(msg.index, mode=self._active_mode)
                     from . import config
@@ -157,10 +174,12 @@ class App:
 
     def _on_image_changed(self, *_args):
         """Try to detect game name from the selected filename."""
+        from .gui import _THEMES
         path = self.window.image_var.get().strip()
+        gray = _THEMES[self.window._current_theme]["gray"]
         if not path:
             self.window.game_label.configure(
-                text="(select an image to detect)", foreground="gray")
+                text="(select an image to detect)", foreground=gray)
             return
 
         filename = os.path.basename(path).lower()
@@ -172,7 +191,7 @@ class App:
                 return
 
         self.window.game_label.configure(
-            text="(will detect when pipeline starts)", foreground="gray")
+            text="(will detect when pipeline starts)", foreground=gray)
 
     def _check_prereqs(self):
         """Run prerequisite checks in a background thread."""
@@ -279,6 +298,16 @@ class App:
                 "modify files in the output folder and try again.")
             return
 
+        if not image_path.lower().endswith(".iso"):
+            proceed = messagebox.askyesno("Non-ISO Input",
+                "The selected image is not an ISO file.\n\n"
+                "Modify Assets can still encrypt your changes, but the output "
+                "will be a raw .img file instead of a bootable Clonezilla ISO.\n\n"
+                "For a Rufus-writable ISO, select the original Clonezilla ISO.\n\n"
+                "Continue anyway?")
+            if not proceed:
+                return
+
         self._save_settings()
         self._active_mode = "modify"
         self.window.set_running(True, mode="modify")
@@ -300,6 +329,7 @@ class App:
             image_path, output_path,
             log_cb, phase_cb, progress_cb, done_cb,
         )
+        self.pipeline.log_link = lambda text, url: self.msg_queue.put(LinkMsg(text, url))
 
         # Intercept game detection
         orig_chroot = self.pipeline._phase_chroot
@@ -344,11 +374,16 @@ class App:
         except (FileNotFoundError, json.JSONDecodeError, KeyError):
             pass  # No saved settings yet
 
+    def _on_theme_change(self, theme):
+        """Save theme preference when user toggles it."""
+        self._save_settings()
+
     def _save_settings(self):
         """Save current field values to disk."""
         settings = {
             "image_path": self.window.image_var.get().strip(),
             "output_path": self.window.output_var.get().strip(),
+            "theme": self.window._current_theme,
         }
         try:
             os.makedirs(_SETTINGS_DIR, exist_ok=True)

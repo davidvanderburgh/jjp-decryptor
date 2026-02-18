@@ -14,6 +14,8 @@ EXTRACT_TIMEOUT = 3600  # partclone extraction can take a while for large images
 COMPILE_TIMEOUT = 60
 DECRYPT_TIMEOUT = 600
 COPY_TIMEOUT = 600
+ISO_CONVERT_TIMEOUT = 7200  # partclone conversion can be slow for large images
+ISO_BUILD_TIMEOUT = 3600    # xorriso ISO creation
 DAEMON_STARTUP_WAIT = 3  # legacy, kept for reference
 DAEMON_READY_TIMEOUT = 15  # seconds to poll for daemon readiness (port 1947)
 USB_SETTLE_TIMEOUT = 10  # seconds to wait for USB device to appear in WSL after usbipd attach
@@ -85,5 +87,7 @@ MOD_PHASES = [
     "Dongle",
     "Compile",
     "Encrypt",
+    "Convert",
+    "Build ISO",
     "Cleanup",
 ]
