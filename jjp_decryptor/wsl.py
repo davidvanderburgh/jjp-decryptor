@@ -2,7 +2,11 @@
 
 import os
 import subprocess
+import sys
 import threading
+
+# Prevent console windows from flashing when launched via pythonw.exe
+_CREATE_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 # Standard install location for usbipd-win
 _USBIPD_PATHS = [
@@ -46,6 +50,7 @@ class WslExecutor:
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout,
+                creationflags=_CREATE_FLAGS,
             )
         except subprocess.TimeoutExpired as e:
             raise WslError(bash_cmd, -1, f"Command timed out after {timeout}s") from e
@@ -67,6 +72,7 @@ class WslExecutor:
                 errors="replace",
                 timeout=timeout,
                 shell=True,
+                creationflags=_CREATE_FLAGS,
             )
             return result.returncode, result.stdout, result.stderr
         except subprocess.TimeoutExpired:
@@ -89,6 +95,7 @@ class WslExecutor:
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            creationflags=_CREATE_FLAGS,
         )
 
         with self._lock:

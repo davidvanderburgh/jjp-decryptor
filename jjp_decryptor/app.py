@@ -8,7 +8,7 @@ import tkinter as tk
 from tkinter import messagebox
 
 from .gui import MainWindow
-from .pipeline import DecryptionPipeline, check_prerequisites
+from .pipeline import DecryptionPipeline, ModPipeline, check_prerequisites
 from .wsl import WslExecutor
 
 # Settings file location
@@ -51,12 +51,16 @@ class App:
         self.msg_queue = queue.Queue()
         self.pipeline = None
         self.wsl = WslExecutor()
+        self._active_mode = "decrypt"  # "decrypt" or "modify"
 
         self.window = MainWindow(
             self.root,
             on_check_prereqs=self._check_prereqs,
             on_start=self._start,
             on_cancel=self._cancel,
+            on_mod_apply=self._mod_start,
+            on_mod_cancel=self._mod_cancel,
+            on_clear_cache=self._clear_cache,
         )
 
         # Detect game name when file is selected (register before loading settings
@@ -69,7 +73,8 @@ class App:
         # Start polling the message queue
         self._poll_queue()
 
-        # Check for stale mounts on startup
+        # Auto-check prerequisites and clean up stale mounts on startup
+        self.root.after(500, self._check_prereqs)
         self.root.after(500, self._check_stale_mounts)
 
     def run(self):
@@ -84,12 +89,15 @@ class App:
                 if isinstance(msg, LogMsg):
                     self.window.append_log(msg.text, msg.level)
                 elif isinstance(msg, PhaseMsg):
-                    self.window.set_phase(msg.index)
+                    self.window.set_phase(msg.index, mode=self._active_mode)
                     from . import config
-                    if msg.index < len(config.PHASES):
-                        self.window.set_status(f"{config.PHASES[msg.index]}...")
+                    phases = config.PHASES if self._active_mode == "decrypt" else config.MOD_PHASES
+                    if msg.index < len(phases):
+                        self.window.set_status(f"{phases[msg.index]}...")
                 elif isinstance(msg, ProgressMsg):
-                    self.window.set_progress(msg.current, msg.total, msg.desc)
+                    self.window.set_progress(
+                        msg.current, msg.total, msg.desc,
+                        mode=self._active_mode)
                 elif isinstance(msg, GameDetectedMsg):
                     self.window.set_game_name(msg.name)
                 elif isinstance(msg, DoneMsg):
@@ -106,20 +114,16 @@ class App:
                 text="(select an image to detect)", foreground="gray")
             return
 
-        # Extract just the filename
-        import os
         filename = os.path.basename(path).lower()
 
-        # Check if any known game key appears in the filename
         from . import config
         for key in config.KNOWN_GAMES:
             if key.lower() in filename:
                 self.window.set_game_name(key)
                 return
 
-        # No match - show that we'll detect during pipeline
         self.window.game_label.configure(
-            text="(will detect when decryption starts)", foreground="gray")
+            text="(will detect when pipeline starts)", foreground="gray")
 
     def _check_prereqs(self):
         """Run prerequisite checks in a background thread."""
@@ -132,7 +136,6 @@ class App:
                     f"  {name}: {'OK' if passed else 'MISSING'} - {message}",
                     "success" if passed else "error",
                 ))
-                # Schedule prereq UI update on main thread
                 self.root.after(0, self.window.set_prereq, name, passed, message)
 
             all_ok = all(p for _, p, _ in results)
@@ -144,6 +147,8 @@ class App:
                     "error"))
 
         threading.Thread(target=_run, daemon=True).start()
+
+    # --- Decrypt pipeline ---
 
     def _start(self):
         """Start the decryption pipeline."""
@@ -159,13 +164,11 @@ class App:
                 "Please select an output folder.")
             return
 
-        # Save paths for next time
         self._save_settings()
+        self._active_mode = "decrypt"
+        self.window.set_running(True, mode="decrypt")
+        self.window.reset_steps(mode="decrypt")
 
-        self.window.set_running(True)
-        self.window.reset_steps()
-
-        # Create pipeline with queue-based callbacks
         def log_cb(text, level="info"):
             self.msg_queue.put(LogMsg(text, level))
 
@@ -194,20 +197,91 @@ class App:
         threading.Thread(target=self.pipeline.run, daemon=True).start()
 
     def _cancel(self):
-        """Cancel the running pipeline."""
+        """Cancel the running decrypt pipeline."""
         if self.pipeline:
             self.window.append_log("Cancelling...", "error")
             self.pipeline.cancel()
 
+    # --- Mod pipeline ---
+
+    def _mod_start(self):
+        """Start the asset modification pipeline."""
+        image_path = self.window.image_var.get().strip()
+        output_path = self.window.output_var.get().strip()
+
+        if not image_path:
+            messagebox.showwarning("Missing Input",
+                "Please select a game image file.")
+            return
+        if not output_path:
+            messagebox.showwarning("Missing Input",
+                "Please select an output folder (containing your modified assets).")
+            return
+        if not os.path.isdir(output_path):
+            messagebox.showerror("Invalid Folder",
+                f"Output folder does not exist:\n{output_path}")
+            return
+
+        checksums_file = os.path.join(output_path, '.checksums.md5')
+        if not os.path.isfile(checksums_file):
+            messagebox.showerror("No Baseline Checksums",
+                "No .checksums.md5 file found in the output folder.\n\n"
+                "Run Decrypt first to generate baseline checksums, then "
+                "modify files in the output folder and try again.")
+            return
+
+        self._save_settings()
+        self._active_mode = "modify"
+        self.window.set_running(True, mode="modify")
+        self.window.reset_steps(mode="modify")
+
+        def log_cb(text, level="info"):
+            self.msg_queue.put(LogMsg(text, level))
+
+        def phase_cb(index):
+            self.msg_queue.put(PhaseMsg(index))
+
+        def progress_cb(current, total, desc=""):
+            self.msg_queue.put(ProgressMsg(current, total, desc))
+
+        def done_cb(success, summary):
+            self.msg_queue.put(DoneMsg(success, summary))
+
+        self.pipeline = ModPipeline(
+            image_path, output_path,
+            log_cb, phase_cb, progress_cb, done_cb,
+        )
+
+        # Intercept game detection
+        orig_chroot = self.pipeline._phase_chroot
+        def patched_chroot():
+            orig_chroot()
+            if self.pipeline.game_name:
+                self.msg_queue.put(GameDetectedMsg(self.pipeline.game_name))
+        self.pipeline._phase_chroot = patched_chroot
+
+        threading.Thread(target=self.pipeline.run, daemon=True).start()
+
+    def _mod_cancel(self):
+        """Cancel the running mod pipeline."""
+        if self.pipeline:
+            self.window.append_log("Cancelling...", "error")
+            self.pipeline.cancel()
+
+    # --- Common ---
+
     def _on_done(self, success, summary):
         """Handle pipeline completion."""
-        self.window.set_running(False)
+        mode = self._active_mode
+        self.window.set_running(False, mode=mode)
         if success:
             self.window.set_status("Complete!")
-            messagebox.showinfo("Decryption Complete", summary)
+            title = "Decryption Complete" if mode == "decrypt" else "Modification Complete"
+            messagebox.showinfo(title, summary)
         else:
             self.window.set_status("Failed")
-            messagebox.showerror("Decryption Failed", summary)
+            title = "Decryption Failed" if mode == "decrypt" else "Modification Failed"
+            messagebox.showerror(title, summary)
 
     def _load_settings(self):
         """Load saved settings and pre-populate GUI fields."""
@@ -234,22 +308,114 @@ class App:
         except OSError:
             pass  # Non-critical
 
+    def _clear_cache(self):
+        """Remove cached extracted images from WSL /tmp/ and output folder."""
+        import glob as globmod
+
+        def _run():
+            files_to_remove = []  # list of (wsl_path, display_name)
+
+            # Check WSL /tmp/ for leftover images
+            try:
+                result = self.wsl.run(
+                    "find /tmp -maxdepth 1 -name 'jjp_raw_*' -type f 2>/dev/null",
+                    timeout=10,
+                )
+                for f in result.strip().split("\n"):
+                    f = f.strip()
+                    if f:
+                        files_to_remove.append((f, f.split("/")[-1] + " (WSL /tmp/)"))
+            except Exception:
+                pass
+
+            # Check output folder for .img files
+            output_path = self.window.output_var.get().strip()
+            if output_path:
+                for win_path in globmod.glob(os.path.join(output_path, "jjp_raw_*.img")):
+                    from .wsl import win_to_wsl
+                    wsl_path = win_to_wsl(win_path)
+                    files_to_remove.append(
+                        (wsl_path, os.path.basename(win_path) + " (output folder)"))
+
+            if not files_to_remove:
+                self.msg_queue.put(LogMsg("No cached images found.", "info"))
+                return
+
+            total_size = 0
+            for wsl_path, _ in files_to_remove:
+                try:
+                    sz = self.wsl.run(f"stat -c%s '{wsl_path}'", timeout=5).strip()
+                    total_size += int(sz)
+                except Exception:
+                    pass
+
+            size_gb = total_size / (1024**3)
+            self.msg_queue.put(LogMsg(
+                f"Removing {len(files_to_remove)} image(s) ({size_gb:.1f} GB)...",
+                "info",
+            ))
+
+            for wsl_path, display in files_to_remove:
+                try:
+                    self.wsl.run(f"rm -f '{wsl_path}'", timeout=30)
+                    self.msg_queue.put(LogMsg(f"  Removed: {display}", "info"))
+                except Exception:
+                    self.msg_queue.put(LogMsg(f"  Failed to remove: {display}", "error"))
+
+            self.msg_queue.put(LogMsg(
+                f"Cache cleared ({size_gb:.1f} GB freed).", "success"))
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def _check_stale_mounts(self):
-        """Check for leftover mounts from crashed runs."""
+        """Clean up leftover mounts from crashed runs on startup."""
         def _run():
             try:
                 from . import config
                 result = self.wsl.run(
-                    f"mount | grep '{config.MOUNT_PREFIX}' | awk '{{print $3}}'",
+                    f"findmnt -rn -o TARGET | grep '{config.MOUNT_PREFIX}'",
                     timeout=10,
                 )
                 mounts = [m.strip() for m in result.strip().split("\n") if m.strip()]
-                if mounts:
-                    self.msg_queue.put(LogMsg(
-                        f"Found {len(mounts)} stale mount(s) from previous runs. "
-                        "They will be cleaned up when you start a new decryption.",
-                        "info",
-                    ))
+                if not mounts:
+                    return
+
+                self.msg_queue.put(LogMsg(
+                    f"Cleaning up {len(mounts)} stale mount(s) from previous runs...",
+                    "info",
+                ))
+
+                # Unmount all in reverse order (submounts before parents)
+                self.wsl.run(
+                    f"findmnt -rn -o TARGET | grep '{config.MOUNT_PREFIX}' | sort -r | "
+                    f"xargs -r -I{{}} umount -lf '{{}}' 2>/dev/null; true",
+                    timeout=30,
+                )
+
+                # Remove empty mount directories
+                self.wsl.run(
+                    f"find /mnt -maxdepth 1 -name 'jjp_*' -type d -empty -delete 2>/dev/null; true",
+                    timeout=10,
+                )
+
+                # Detach any stale loop devices
+                try:
+                    loops = self.wsl.run(
+                        "losetup -a 2>/dev/null | grep jjp_raw",
+                        timeout=10,
+                    ).strip()
+                    for line in loops.split("\n"):
+                        line = line.strip()
+                        if line:
+                            loop_dev = line.split(":")[0]
+                            try:
+                                self.wsl.run(f"losetup -d '{loop_dev}' 2>/dev/null; true", timeout=5)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+                self.msg_queue.put(LogMsg("Stale mounts cleaned up.", "success"))
             except Exception:
                 pass  # Non-critical
 

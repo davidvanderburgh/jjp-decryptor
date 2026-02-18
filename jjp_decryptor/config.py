@@ -75,3 +75,15 @@ PHASES = [
     "Copy",
     "Cleanup",
 ]
+
+# Mod pipeline phase names
+MOD_PHASES = [
+    "Scan",
+    "Extract",
+    "Mount",
+    "Chroot",
+    "Dongle",
+    "Compile",
+    "Encrypt",
+    "Cleanup",
+]
