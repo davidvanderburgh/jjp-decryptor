@@ -1,6 +1,6 @@
 # JJP Asset Decryptor
 
-A Windows GUI application that decrypts game assets from Jersey Jack Pinball (JJP) machines. Automates a multi-step process that would otherwise require ~20 manual shell commands per game.
+A Windows GUI application that decrypts and modifies game assets from Jersey Jack Pinball (JJP) machines. Automates a multi-step process that would otherwise require ~20 manual shell commands per game.
 
 ## What It Does
 
@@ -11,6 +11,7 @@ JJP pinball machines store encrypted game assets (graphics, videos, audio) on th
 3. Passes through the game's Sentinel HASP USB security dongle via usbipd
 4. Compiles and injects a decryptor that hooks the game's own crypto functions
 5. Decrypts all game assets and copies them to your chosen output folder
+6. **Modify Assets**: Replace decrypted assets (images, audio, video) and re-encrypt them back into the game image for loading onto the machine
 
 ## Supported Games
 
@@ -48,18 +49,59 @@ No additional Python packages are required (uses only the standard library).
 
 **Windows only.** The tool relies on WSL2 for Linux filesystem operations and usbipd-win for USB dongle passthrough, neither of which are available on macOS or Linux.
 
+## Installation
+
+1. Clone the repository:
+   ```
+   git clone <repo-url>
+   cd jjp
+   ```
+
+2. (Optional) Create a desktop shortcut with the app icon:
+   ```
+   create_shortcut.bat
+   ```
+   This creates a "JJP Asset Decryptor" shortcut on your desktop.
+
+3. Or launch directly:
+   ```
+   python -m jjp_decryptor
+   ```
+   You can also double-click `JJP Asset Decryptor.pyw` to launch without a console window.
+
 ## Usage
 
-```
-python -m jjp_decryptor
-```
+### Decrypting Assets
 
-1. Click **Browse** to select your game image (ISO or ext4)
-2. Click **Browse** to select an output folder for decrypted assets
-3. Click **Check Prerequisites** to verify your setup
-4. Click **Start Decryption**
+1. Launch the app (desktop shortcut, `.pyw` file, or `python -m jjp_decryptor`)
+2. Prerequisites are checked automatically on startup
+3. Click **Browse** to select your game image (ISO or ext4)
+4. Click **Browse** to select an output folder for decrypted assets
+5. Click **Start Decryption**
 
 The app remembers your last-used image and output paths between sessions.
+
+### Modifying Assets
+
+After decrypting, you can replace game assets and re-encrypt them:
+
+1. Switch to the **Modify Assets** tab
+2. Browse to the same game image and the output folder from decryption
+3. Modify files in the output folder (replace PNGs, OGGs, WebMs, etc.)
+4. Click **Apply Modifications** — the tool detects changed files via checksums and re-encrypts only what changed
+5. The modified `.img` file is saved to your output folder
+
+**Writing to the machine:**
+1. Write the modified `.img` file to a USB drive using Win32 Disk Imager, balenaEtcher, or Rufus (dd mode)
+2. Insert the USB drive into the pinball machine's USB port
+3. Power on the machine and follow the on-screen update prompt
+4. Remove the USB drive and power-cycle the machine
+
+**File format notes:**
+- Images should be PNG (same as originals)
+- Videos should be WebM
+- Audio should be OGG
+- Format mismatches won't corrupt the image but may crash/glitch the game at runtime
 
 ## How It Works
 
@@ -71,9 +113,11 @@ The decryptor uses an LD_PRELOAD hook that intercepts the game binary's `al_inst
 4. For each file entry: seeds the crypto PRNG with the file path, then XOR-decrypts with the 64-bit keystream
 5. Strips filler bytes and writes the decrypted content to the output directory
 
-The crypto algorithm is the game's own implementation, accessed through the game binary's exported symbols. The HASP dongle provides the initial decryption key for the file list.
+The encryption is symmetric XOR, so the same algorithm encrypts and decrypts. The **Modify Assets** feature uses this to re-encrypt replacement files back into the game image.
 
 ## Pipeline Phases
+
+### Decrypt
 
 | Phase | Description |
 |-------|-------------|
@@ -85,6 +129,19 @@ The crypto algorithm is the game's own implementation, accessed through the game
 | Decrypt | Run the game binary with the hook, decrypt all assets |
 | Copy | Copy decrypted files from WSL to your Windows output folder |
 | Cleanup | Unmount everything, detach USB, remove temporary files |
+
+### Modify Assets
+
+| Phase | Description |
+|-------|-------------|
+| Scan | Compare output folder against saved checksums to find modified files |
+| Extract | Locate or extract the game image |
+| Mount | Loop-mount the ext4 image in WSL2 |
+| Chroot | Set up bind mounts for the game environment |
+| Dongle | Attach HASP USB dongle to WSL via usbipd, start the license daemon |
+| Compile | Compile the C encryptor hook |
+| Encrypt | Re-encrypt modified files into the game image with round-trip verification |
+| Cleanup | Unmount everything, detach USB, move image to output folder |
 
 ## Troubleshooting
 
@@ -103,11 +160,11 @@ Run in a terminal: `wsl -u root -- apt update && wsl -u root -- apt install gcc`
 ### Stale mounts from a previous crash
 The app detects and cleans up stale mounts automatically on startup. If you have issues, you can manually clean up:
 ```
-wsl -u root -- bash -c "umount -R /mnt/jjp_*; rmdir /mnt/jjp_*"
+wsl -u root -- bash -c "findmnt -rn -o TARGET | grep /mnt/jjp_ | sort -r | xargs -r umount -lf; rmdir /mnt/jjp_* 2>/dev/null"
 ```
 
 ### Extraction is slow
-The first run for each ISO requires extracting the partclone image to a raw ext4 file. This can take several minutes for large images (up to 32 GB). The raw image is cached in WSL's `/tmp/` so subsequent runs skip this step.
+The first run for each ISO requires extracting the partclone image to a raw ext4 file. This can take several minutes for large images (up to 32 GB). The raw image is cached so subsequent runs skip this step. Use the **Clear Cache** button to free up disk space.
 
 ## License
 

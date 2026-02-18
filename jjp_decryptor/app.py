@@ -77,9 +77,58 @@ class App:
         self.root.after(500, self._check_prereqs)
         self.root.after(500, self._check_stale_mounts)
 
+        # Intercept window close to offer cache cleanup
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
     def run(self):
         """Start the tkinter mainloop."""
         self.root.mainloop()
+
+    def _on_close(self):
+        """Handle window close — offer to free cached images in WSL /tmp."""
+        try:
+            result = self.wsl.run(
+                "find /tmp -maxdepth 1 -name 'jjp_raw_*' -type f "
+                "-printf '%f %s\\n' 2>/dev/null",
+                timeout=5,
+            ).strip()
+            if result:
+                files = []
+                total_bytes = 0
+                for line in result.split("\n"):
+                    parts = line.strip().rsplit(" ", 1)
+                    if len(parts) == 2:
+                        files.append(parts[0])
+                        try:
+                            total_bytes += int(parts[1])
+                        except ValueError:
+                            pass
+                if files:
+                    size_gb = total_bytes / (1024**3)
+                    names = "\n".join(f"/tmp/{f}" for f in files)
+                    answer = messagebox.askyesnocancel(
+                        "Free Disk Space?",
+                        f"There are cached game images in WSL using "
+                        f"{size_gb:.1f} GB of disk space:\n\n"
+                        f"{names}\n\n"
+                        f"Would you like to delete them to free up space?\n\n"
+                        f"Keeping them speeds up future runs by skipping\n"
+                        f"the extraction step. Your output folder and\n"
+                        f"original ISOs are not affected either way.",
+                    )
+                    if answer is None:
+                        return  # Cancel — don't close
+                    if answer:
+                        self.wsl.run(
+                            "find /tmp -maxdepth 1 -name 'jjp_raw_*' -type f "
+                            "-delete 2>/dev/null; true",
+                            timeout=30,
+                        )
+        except Exception:
+            pass  # Don't block close if WSL is unavailable
+
+        self._save_settings()
+        self.root.destroy()
 
     def _poll_queue(self):
         """Process messages from background threads."""
