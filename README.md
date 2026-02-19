@@ -21,8 +21,12 @@ Confirmed working:
 
 Not yet tested (but should work — same platform):
 
+- Wizard of Oz
+- Dialed In
+- Toy Story
 - The Godfather
 - Avatar
+- Harry Potter
 
 Each game requires its own HASP USB dongle (the purple USB dongle attached to the motherboard inside the machine).
 
