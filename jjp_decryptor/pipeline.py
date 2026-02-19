@@ -1271,9 +1271,8 @@ class ModPipeline(DecryptionPipeline):
                 self.log("", "info")
                 self.log("=== Next Steps ===", "info")
                 self.log(
-                    "1. Write this ISO to a USB drive (see instructions below)\n"
-                    "   Rufus: select DD Image mode (NOT ISO mode)\n"
-                    "   Or use: balenaEtcher, Win32DiskImager, or dd\n"
+                    "1. Write this ISO to a USB drive using Rufus\n"
+                    "   Important: select ISO mode (NOT DD mode) when prompted\n"
                     "2. Boot the pinball machine from USB\n"
                     "3. Let Clonezilla restore the image to the machine",
                     "info",
@@ -1330,46 +1329,24 @@ class ModPipeline(DecryptionPipeline):
     # --- Extract override ---
 
     def _phase_extract(self):
-        """Check for the raw image in the output folder first.
+        """Always extract a fresh image from the original ISO for mod runs.
 
-        If a previous decrypt run moved the image there, use it directly
-        (no extraction needed, no /tmp usage). Otherwise fall back to
-        the parent's ISO extraction.
+        Each mod run must start from a pristine image to avoid accumulated
+        state from previous runs (modified files, dirty journals, etc.).
+        Deletes any cached images from /tmp before extracting.
         """
-        import os, glob
+        import os
 
-        # Look for jjp_raw_*.img in the assets folder
-        pattern = os.path.join(self.assets_folder, "jjp_raw_*.img")
-        matches = glob.glob(pattern)
-        if matches:
-            # Use the first match (there should only be one)
-            win_path = matches[0]
-            wsl_path = win_to_wsl(win_path)
-            try:
-                fstype = self.wsl.run(
-                    f"blkid -o value -s TYPE '{wsl_path}'", timeout=10,
-                ).strip()
-            except WslError:
-                fstype = ""
+        # Delete any cached image from previous runs to force fresh extraction
+        cache_path = self._raw_img_cache_path()
+        self.log("Clearing cached image to ensure fresh extraction...", "info")
+        try:
+            self.wsl.run(
+                f"rm -f '{cache_path}' 2>/dev/null; true", timeout=30)
+        except WslError:
+            pass
 
-            if "ext" in fstype:
-                sz = "?"
-                try:
-                    sz_raw = self.wsl.run(
-                        f"stat -c%s '{wsl_path}'", timeout=5).strip()
-                    sz = f"{int(sz_raw) / (1024**3):.1f} GB"
-                except (WslError, ValueError):
-                    pass
-                self.log(
-                    f"Found game image in output folder: "
-                    f"{os.path.basename(win_path)} ({sz})",
-                    "success",
-                )
-                self._raw_img_path = wsl_path
-                self.on_progress(100, 100, "Using existing image")
-                return
-
-        # No image in output folder, fall back to ISO extraction
+        # Extract fresh from the original ISO
         super()._phase_extract()
 
     # --- Phase 0: Scan ---
@@ -1575,8 +1552,8 @@ class ModPipeline(DecryptionPipeline):
         self.log(f"Manifest written with {len(self.changed_files)} entries.", "info")
 
         # Run the game binary with the encryptor hook
-        self.log("Running encryptor...", "info")
         game_bin = f"{config.GAME_BASE_PATH}/{self.game_name}/game"
+        self.log("Running encryptor...", "info")
         ld_lib_path = f"LD_LIBRARY_PATH=/tmp/stubs " if getattr(self, '_stubs_built', 0) > 0 else ""
 
         cmd = (
@@ -1605,6 +1582,10 @@ class ModPipeline(DecryptionPipeline):
                 r'Progress:\s*(\d+)\s*\(ok=(\d+)\s+fail=(\d+)\)')
             result_re = re.compile(
                 r'Total:\s*(\d+)\s+OK:\s*(\d+)\s+Failed:\s*(\d+)')
+            fl_updated_re = re.compile(r'FL_DAT_UPDATED=1')
+            fl_failed_re = re.compile(r'FL_DAT_FAILED=1')
+            fl_dat_updated = False
+            fl_dat_failed = False
 
             try:
                 for line in self.wsl.stream(cmd, timeout=config.DECRYPT_TIMEOUT):
@@ -1623,12 +1604,11 @@ class ModPipeline(DecryptionPipeline):
                         level = "error"
                     elif "[VERIFY OK]" in line or "decrypted OK" in line:
                         level = "success"
-                    elif "fl.dat updated successfully" in line:
+                    elif "forge:" in line and "OK" in line:
                         level = "success"
-                    elif "fl.dat written" in line:
+                    elif "fl.dat restored" in line:
                         level = "success"
-                    elif ("Could not re-encrypt fl.dat" in line
-                          or "WARNING" in line):
+                    elif "WARNING" in line or "WARN" in line:
                         level = "error"
                     self.log(line, level)
 
@@ -1650,6 +1630,11 @@ class ModPipeline(DecryptionPipeline):
                         final_total = int(m.group(1))
                         final_ok = int(m.group(2))
                         final_fail = int(m.group(3))
+
+                    if fl_updated_re.search(line):
+                        fl_dat_updated = True
+                    if fl_failed_re.search(line):
+                        fl_dat_failed = True
 
             except WslError:
                 if final_total > 0:
@@ -1691,6 +1676,9 @@ class ModPipeline(DecryptionPipeline):
             summary += " successfully"
             self.log(summary, "success")
 
+        # CRC forgery mode: fl.dat is restored unmodified
+        self.log("CRC32 forgery: encrypted files match original fl.dat checksums.", "success")
+
     # --- Phase 7: Convert (raw ext4 → partclone) ---
 
     def _phase_convert(self):
@@ -1701,6 +1689,23 @@ class ModPipeline(DecryptionPipeline):
         # Also run e2fsck to fix any metadata inconsistencies from the
         # read-write mount + file modifications.
         if self.mount_point:
+            # Clean up build artifacts from /tmp inside the chroot BEFORE
+            # unmounting, so they don't end up in the partclone image.
+            self.log("Cleaning build artifacts from image...", "info")
+            mp = self.mount_point
+            for artifact in [
+                f"{mp}/tmp/jjp_encrypt.c",
+                f"{mp}/tmp/jjp_encrypt.o",
+                f"{mp}/tmp/jjp_encrypt.so",
+                f"{mp}/tmp/jjp_manifest.txt",
+                f"{mp}/tmp/jjp_replacements",
+                f"{mp}/tmp/stubs",
+            ]:
+                try:
+                    self.wsl.run(f"rm -rf '{artifact}' 2>/dev/null; true", timeout=5)
+                except WslError:
+                    pass
+
             self.log("Unmounting ext4 for conversion...", "info")
             # Unmount bind mounts first (reverse order)
             for target in reversed(self._bind_mounted):
@@ -1784,12 +1789,14 @@ class ModPipeline(DecryptionPipeline):
             pass
         self.log(f"Using split size: {split_size} bytes", "info")
 
-        # Prefer pigz (parallel gzip) for speed
+        # Prefer pigz (parallel gzip) for speed.
+        # Use --fast -b 1024 --rsyncable to match the original Clonezilla
+        # compression flags, ensuring maximum compatibility.
         try:
             self.wsl.run("which pigz", timeout=5)
-            compressor = "pigz -c"
+            compressor = "pigz -c --fast -b 1024 --rsyncable"
         except WslError:
-            compressor = "gzip -c"
+            compressor = "gzip -c --fast --rsyncable"
 
         # Run the conversion pipeline — output to a temp chunks directory.
         # The build phase will splice these into the original ISO.
