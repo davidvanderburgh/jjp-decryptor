@@ -39,8 +39,12 @@ Each game requires its own HASP USB dongle (the purple USB dongle attached to th
 - **Sentinel HASP USB dongle** for the game you want to decrypt
 - **Game image**: Clonezilla ISO backup or raw ext4 filesystem image — download "full installs" from https://marketing.jerseyjackpinball.com/downloads/
 - **Python 3.10+** (Windows): [python.org](https://www.python.org/downloads/)
+- **Rufus** (for writing modified ISOs to USB): [rufus.ie](https://rufus.ie/)
+- **~40 GB free disk space** in WSL — the extracted raw ext4 image can be up to 32 GB, plus temporary partclone chunks during ISO rebuilds
 
 No additional Python packages are required (uses only the standard library).
+
+The Modify Assets pipeline also requires `partclone` and `xorriso` in WSL — the tool installs these automatically on first use, or you can install them manually: `wsl -u root -- apt install partclone xorriso`
 
 **Windows only.** The tool relies on WSL2 for Linux filesystem operations and usbipd-win for USB dongle passthrough.
 
