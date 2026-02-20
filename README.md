@@ -268,4 +268,4 @@ The first run for each ISO requires extracting the partclone image to a raw ext4
 
 ## License
 
-This project is provided as-is for personal use with JJP pinball machines you own.
+MIT License. See [LICENSE](LICENSE) for details.
