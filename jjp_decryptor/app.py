@@ -7,8 +7,10 @@ import threading
 import tkinter as tk
 from tkinter import messagebox
 
+from . import __version__
 from .gui import MainWindow
 from .pipeline import DecryptionPipeline, ModPipeline, check_prerequisites
+from .updater import check_for_update
 from .wsl import WslExecutor
 
 # Settings file location
@@ -88,9 +90,13 @@ class App:
         # Start polling the message queue
         self._poll_queue()
 
-        # Auto-check prerequisites and clean up stale mounts on startup
+        # Show version in title bar
+        self.root.title(f"JJP Asset Decryptor v{__version__}")
+
+        # Auto-check prerequisites, update, and clean up stale mounts on startup
         self.root.after(500, self._check_prereqs)
         self.root.after(500, self._check_stale_mounts)
+        self.root.after(1500, self._check_for_update)
 
         # Intercept window close to offer cache cleanup
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -213,6 +219,19 @@ class App:
                 self.msg_queue.put(LogMsg(
                     "Some prerequisites are missing. Fix them before proceeding.",
                     "error"))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _check_for_update(self):
+        """Check GitHub for a newer release in a background thread."""
+        def _run():
+            result = check_for_update(__version__)
+            if result:
+                version, url = result
+                self.msg_queue.put(LogMsg(
+                    f"Update available: v{version}", "info"))
+                self.msg_queue.put(LinkMsg(
+                    f"Download v{version}", url))
 
         threading.Thread(target=_run, daemon=True).start()
 

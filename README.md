@@ -35,37 +35,43 @@ Each game requires its own HASP USB dongle (the purple USB dongle attached to th
 - **Windows 10/11** with WSL2 enabled
 - **WSL2** with Ubuntu (or similar): `wsl --install`
 - **gcc** in WSL: `wsl -u root -- apt install gcc`
+- **partclone** in WSL: `wsl -u root -- apt install partclone`
+- **xorriso** in WSL: `wsl -u root -- apt install xorriso`
 - **usbipd-win**: Install from [github.com/dorssel/usbipd-win](https://github.com/dorssel/usbipd-win/releases)
 - **Sentinel HASP USB dongle** for the game you want to decrypt
 - **Game image**: Clonezilla ISO backup or raw ext4 filesystem image — download "full installs" from https://marketing.jerseyjackpinball.com/downloads/
-- **Python 3.10+** (Windows): [python.org](https://www.python.org/downloads/)
 - **Rufus** (for writing modified ISOs to USB): [rufus.ie](https://rufus.ie/)
 - **~40 GB free disk space** in WSL — the extracted raw ext4 image can be up to 32 GB, plus temporary partclone chunks during ISO rebuilds
 
 No additional Python packages are required (uses only the standard library).
 
-The Modify Assets pipeline also requires `partclone` and `xorriso` in WSL — the tool installs these automatically on first use, or you can install them manually: `wsl -u root -- apt install partclone xorriso`
-
 **Windows only.** The tool relies on WSL2 for Linux filesystem operations and usbipd-win for USB dongle passthrough.
 
 ## Installation
 
-1. Clone the repository:
-   ```
-   git clone <repo-url>
-   cd jjp
-   ```
+### Option 1: Installer (Recommended)
 
-2. (Optional) Create a desktop shortcut with the app icon:
-   ```
-   create_shortcut.bat
-   ```
+1. Download `JJP_Asset_Decryptor_Setup.exe` from the [Releases page](https://github.com/davidvanderburgh/jjp-decryptor/releases)
+2. Run the installer — it includes a bundled Python runtime (no Python installation needed)
+3. When prompted, check **Install prerequisites** to set up WSL2, gcc, partclone, xorriso, and usbipd-win
+4. If WSL2 was just enabled, reboot and re-run the prerequisites installer from the Start Menu: **JJP Asset Decryptor > Install Prerequisites**
 
-3. Or launch directly:
+The app checks for updates automatically on startup and will notify you when a new version is available.
+
+### Option 2: Run from Source
+
+1. Install [Python 3.10+](https://www.python.org/downloads/) (Windows)
+2. Clone the repository:
+   ```
+   git clone https://github.com/davidvanderburgh/jjp-decryptor.git
+   cd jjp-decryptor
+   ```
+3. Install prerequisites manually (see Requirements above)
+4. Launch:
    ```
    python -m jjp_decryptor
    ```
-   You can also double-click `JJP Asset Decryptor.pyw` to launch without a console window.
+   You can also double-click `JJP Asset Decryptor.pyw` to launch without a console window, or run `create_shortcut.bat` to create a desktop shortcut.
 
 ## Usage
 
@@ -114,7 +120,8 @@ jjp_decryptor/
 ├── pipeline.py      # DecryptionPipeline and ModPipeline — orchestrates all phases
 ├── resources.py     # Embedded C sources (decrypt hook, encrypt hook, stub libraries)
 ├── config.py        # Constants (paths, timeouts, known games, phase names)
-└── wsl.py           # WSL2 command executor and Windows↔WSL path conversion
+├── wsl.py           # WSL2 command executor and Windows↔WSL path conversion
+└── updater.py       # Auto-update checker (GitHub releases API)
 ```
 
 The app uses a **background thread + queue** pattern: the pipeline runs in a worker thread and posts `LogMsg`, `PhaseMsg`, `ProgressMsg`, and `DoneMsg` objects to a queue. The main thread polls the queue at 100ms intervals to update the GUI.
@@ -265,6 +272,33 @@ wsl -u root -- bash -c "findmnt -rn -o TARGET | grep /mnt/jjp_ | sort -r | xargs
 
 ### Extraction is slow
 The first run for each ISO requires extracting the partclone image to a raw ext4 file. This can take several minutes for large images (up to 32 GB). The raw image is cached so subsequent decrypt runs skip this step. Use the **Clear Cache** button (trash icon) to free up disk space.
+
+## Building the Installer
+
+To build the installer from source, you need [Inno Setup 6](https://jrsoftware.org/isinfo.php) installed.
+
+```powershell
+cd installer
+powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
+```
+
+The build script:
+1. Downloads a Python embeddable distribution with tkinter support
+2. Reads the version from `jjp_decryptor/__init__.py`
+3. Compiles the Inno Setup installer
+
+Output: `installer/Output/JJP_Asset_Decryptor_Setup_v<version>.exe`
+
+### Versioning
+
+The version number lives in `jjp_decryptor/__init__.py` as `__version__`. To release a new version:
+
+1. Bump `__version__` in `jjp_decryptor/__init__.py`
+2. Run `installer/build.ps1` to build the installer
+3. Commit, tag `v<version>`, push
+4. Create a GitHub release and attach the installer `.exe`
+
+Users running older versions will see an update notification on their next launch.
 
 ## License
 

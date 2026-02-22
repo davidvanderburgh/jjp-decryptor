@@ -96,7 +96,9 @@ class MainWindow:
         self._on_clear_cache = on_clear_cache
         self._on_theme_change = on_theme_change
 
-        root.title("JJP Asset Decryptor")
+        # Title is set by App (includes version); fallback here for standalone use
+        if not root.title():
+            root.title("JJP Asset Decryptor")
         root.geometry("780x720")
         root.minsize(700, 600)
 

@@ -35,6 +35,10 @@ extract_jcrypt2
 # Claude Code
 .claude/
 
+# Installer build artifacts
+installer/build/
+installer/Output/
+
 # IDE / OS
 .vscode/
 .idea/

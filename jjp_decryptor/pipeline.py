@@ -2157,20 +2157,20 @@ def check_prerequisites(wsl):
         results.append(("HASP Dongle", False,
             "Sentinel HASP dongle not detected. Plug it in."))
 
-    # partclone (optional — auto-installed at runtime if missing)
+    # partclone
     try:
         wsl.run("which partclone.ext4", timeout=10)
         results.append(("partclone", True, "Available"))
     except Exception:
         results.append(("partclone", False,
-            "Not installed (will auto-install during Modify Assets)"))
+            "Not installed. Run: wsl -u root -- apt install partclone"))
 
-    # xorriso (optional — auto-installed at runtime if missing)
+    # xorriso
     try:
         wsl.run("which xorriso", timeout=10)
         results.append(("xorriso", True, "Available"))
     except Exception:
         results.append(("xorriso", False,
-            "Not installed (will auto-install during Modify Assets)"))
+            "Not installed. Run: wsl -u root -- apt install xorriso"))
 
     return results
