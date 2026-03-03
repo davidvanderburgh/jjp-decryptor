@@ -43,7 +43,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"
-Name: "runprereqs"; Description: "Install prerequisites after setup (WSL2, partclone, xorriso, debugfs, pigz, ffmpeg)"; GroupDescription: "Prerequisites:"; Flags: checked
+Name: "runprereqs"; Description: "Install prerequisites after setup (WSL2, partclone, xorriso, debugfs, pigz, ffmpeg)"; GroupDescription: "Prerequisites:"
 
 [Files]
 ; Bundled Python with tkinter
