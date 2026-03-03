@@ -90,7 +90,6 @@ class App:
             on_cancel=self._cancel,
             on_mod_apply=self._mod_start,
             on_mod_cancel=self._mod_cancel,
-            on_clear_cache=self._clear_cache,
             on_theme_change=self._on_theme_change,
             initial_theme=saved_theme,
             on_install_prereqs=self._install_prereqs,
@@ -483,9 +482,11 @@ class App:
                    "and auto-detect filler sizes.", "info")
         log_cb("No dongle, chroot, or gcc required.", "success")
 
+        full_dump = self.window.full_dump_var.get()
         self.pipeline = StandaloneDecryptPipeline(
             image_path, output_path, fl_dat_path,
             log_cb, phase_cb, progress_cb, done_cb,
+            full_dump=full_dump,
         )
         threading.Thread(target=self.pipeline.run, daemon=True).start()
 
@@ -555,9 +556,11 @@ class App:
                    "and auto-detect filler sizes.", "info")
         log_cb("Direct SSD mode \u2014 no ISO extraction needed.", "success")
 
+        full_dump = self.window.full_dump_var.get()
         self.pipeline = DirectSSDDecryptPipeline(
             device.device_id, output_path, fl_dat_path,
             log_cb, phase_cb, progress_cb, done_cb,
+            full_dump=full_dump,
         )
         threading.Thread(target=self.pipeline.run, daemon=True).start()
 
@@ -927,73 +930,6 @@ class App:
                 json.dump(settings, f, indent=2)
         except OSError:
             pass  # Non-critical
-
-    def _clear_cache(self):
-        """Remove cached extracted images from WSL /tmp/ and output folder."""
-        import glob as globmod
-
-        def _run():
-            files_to_remove = []  # list of (exec_path, display_name)
-
-            # Determine cache location label
-            if sys.platform == "win32":
-                cache_label = "WSL /tmp/"
-            elif sys.platform == "darwin":
-                cache_label = "Docker /tmp/"
-            else:
-                cache_label = "/tmp/"
-
-            # Check executor /tmp/ for leftover images
-            try:
-                result = self.executor.run(
-                    "find /tmp -maxdepth 1 -name 'jjp_raw_*' -type f 2>/dev/null",
-                    timeout=10,
-                )
-                for f in result.strip().split("\n"):
-                    f = f.strip()
-                    if f:
-                        files_to_remove.append(
-                            (f, f.split("/")[-1] + f" ({cache_label})"))
-            except Exception:
-                pass
-
-            # Check output folder for .img files
-            output_path = self.window.output_var.get().strip()
-            if output_path:
-                for host_path in globmod.glob(os.path.join(output_path, "jjp_raw_*.img")):
-                    exec_path = self.executor.to_exec_path(host_path)
-                    files_to_remove.append(
-                        (exec_path, os.path.basename(host_path) + " (output folder)"))
-
-            if not files_to_remove:
-                self.msg_queue.put(LogMsg("No cached images found.", "info"))
-                return
-
-            total_size = 0
-            for exec_path, _ in files_to_remove:
-                try:
-                    sz = self.executor.run(f"stat -c%s '{exec_path}'", timeout=5).strip()
-                    total_size += int(sz)
-                except Exception:
-                    pass
-
-            size_gb = total_size / (1024**3)
-            self.msg_queue.put(LogMsg(
-                f"Removing {len(files_to_remove)} image(s) ({size_gb:.1f} GB)...",
-                "info",
-            ))
-
-            for exec_path, display in files_to_remove:
-                try:
-                    self.executor.run(f"rm -f '{exec_path}'", timeout=30)
-                    self.msg_queue.put(LogMsg(f"  Removed: {display}", "info"))
-                except Exception:
-                    self.msg_queue.put(LogMsg(f"  Failed to remove: {display}", "error"))
-
-            self.msg_queue.put(LogMsg(
-                f"Cache cleared ({size_gb:.1f} GB freed).", "success"))
-
-        threading.Thread(target=_run, daemon=True).start()
 
     def _check_stale_mounts(self):
         """Clean up leftover mounts from crashed runs on startup."""

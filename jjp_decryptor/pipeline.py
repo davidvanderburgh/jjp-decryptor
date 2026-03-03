@@ -2612,10 +2612,12 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
     """
 
     def __init__(self, image_path, output_path, fl_dat_path,
-                 log_cb, phase_cb, progress_cb, done_cb):
+                 log_cb, phase_cb, progress_cb, done_cb,
+                 full_dump=False):
         super().__init__(image_path, output_path,
                          log_cb, phase_cb, progress_cb, done_cb)
         self.fl_dat_path = fl_dat_path  # can be None for fully dongle-free
+        self.full_dump = full_dump
 
     def run(self):
         """Execute the standalone pipeline."""
@@ -2667,6 +2669,11 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
             self.on_phase(2)  # Decrypt
             self._phase_decrypt_standalone()
             self._check_cancel()
+
+            # Full filesystem dump (if requested)
+            if self.full_dump:
+                self._phase_copy_full_filesystem()
+                self._check_cancel()
 
             self._succeeded = True
             self.on_phase(cleanup_phase)  # Cleanup
@@ -2750,10 +2757,13 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
         has_fl_dat = self.fl_dat_path and os.path.isfile(self.fl_dat_path)
 
         if has_fl_dat:
-            # Copy cached fl.dat
+            # Copy cached fl.dat (skip if already in the output folder)
             wsl_fl = self.executor.to_exec_path(self.fl_dat_path)
-            self.executor.run(
-                f"cp '{wsl_fl}' '{wsl_out}/fl_decrypted.dat'", timeout=10)
+            wsl_fl_dest = f"{wsl_out}/fl_decrypted.dat"
+            if os.path.normpath(os.path.abspath(self.fl_dat_path)) != \
+               os.path.normpath(os.path.join(self.output_path, "fl_decrypted.dat")):
+                self.executor.run(
+                    f"cp '{wsl_fl}' '{wsl_fl_dest}'", timeout=10)
             self.executor.run(
                 f"cp '{wsl_fl}' /tmp/fl_decrypted.dat", timeout=10)
             self.log("Using cached fl_decrypted.dat", "info")
@@ -2847,6 +2857,92 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
         # Generate checksums for future modification comparison
         wsl_out = self.executor.to_exec_path(self.output_path)
         self._generate_checksums(wsl_out)
+
+    def _phase_copy_full_filesystem(self):
+        """Copy all non-edata files from the mounted filesystem to output/system/.
+
+        These files are NOT encrypted — they include the game binary, scripts,
+        shared libraries, OS configs, kernel modules, etc.  They are not listed
+        in fl.dat, so no CRC checks apply.
+
+        Uses tar streaming instead of rsync for much faster cross-filesystem
+        transfer (single pipe vs thousands of individual file writes across
+        the WSL→NTFS bridge).
+        """
+        self.log("Copying full filesystem (non-asset files)...", "info")
+        mp = self.mount_point
+        wsl_out = self.executor.to_exec_path(self.output_path)
+        sys_out = f"{wsl_out}/system"
+
+        self.executor.run(f"mkdir -p '{sys_out}'", timeout=10)
+
+        game = self.game_name or ""
+        edata_rel = f"jjpe/gen1/{game}/edata"
+
+        # Exclude edata (already decrypted) and Linux virtual/special dirs
+        # that can't be copied to NTFS
+        excludes = [edata_rel, "proc", "sys", "dev", "run", "tmp",
+                    "lost+found"]
+
+        # Count all filesystem entries (files, symlinks, dirs) for accurate
+        # progress — tar xvf outputs all of them, not just regular files.
+        prune_args = " ".join(
+            f"-path '{mp}/{d}' -prune -o" for d in excludes)
+        try:
+            total_str = self.executor.run(
+                f"find '{mp}/' {prune_args} "
+                f"-print 2>/dev/null | wc -l",
+                timeout=30).strip()
+            total_entries = int(total_str)
+        except (CommandError, ValueError):
+            total_entries = 0
+
+        if total_entries > 0:
+            self.log(f"Found {total_entries} system entries to copy.", "info")
+        self.on_progress(0, total_entries or 1, "Copying system files...")
+
+        # tar pipe: archive everything except excluded dirs, stream straight
+        # to extraction at the destination.  Much faster than rsync/cp for
+        # large file counts across the WSL→NTFS filesystem bridge.
+        # Use verbose extract (tar xvf) to get per-entry progress via stream().
+        tar_excludes = " ".join(
+            f"--exclude='./{d}'" for d in excludes)
+        try:
+            copied = 0
+            for line in self.executor.stream(
+                f"cd '{mp}' && tar cf - "
+                f"{tar_excludes} "
+                f"--warning=no-file-changed "
+                f". 2>/dev/null "
+                f"| tar xvf - -C '{sys_out}/' 2>&1; true",
+                timeout=config.COPY_TIMEOUT,
+            ):
+                self._check_cancel()
+                if line.strip():
+                    copied += 1
+                    if total_entries > 0 and copied % 200 == 0:
+                        pct = min(int(copied * 100 / total_entries), 99)
+                        self.on_progress(
+                            min(copied, total_entries), total_entries,
+                            f"Copying system files ({pct}%)")
+        except CommandError:
+            self.log("Some files could not be copied (permission errors "
+                     "or special files skipped).", "info")
+
+        self.on_progress(total_entries or 1, total_entries or 1,
+                         "System copy complete")
+
+        # Count and report
+        try:
+            count = self.executor.run(
+                f"find '{sys_out}' -type f | wc -l", timeout=30).strip()
+            size = self.executor.run(
+                f"du -sh '{sys_out}' | cut -f1", timeout=30).strip()
+        except CommandError:
+            count, size = "?", "?"
+
+        self.log(f"System dump: {count} files ({size}) saved to system/",
+                 "success")
 
     def _phase_cleanup_standalone(self):
         """Simplified cleanup - no daemon or USB to clean up."""
@@ -3691,12 +3787,29 @@ class StandaloneModPipeline(ModPipeline):
         """Re-encrypt changed files using pure Python crypto.
 
         Writes encrypted files into the raw ext4 image via debugfs
-        (no mount needed).
+        (no mount needed).  System files (from system/ subfolder) are
+        written directly without encryption.
         """
         import os
         import re as _re
         from .crypto import encrypt_file
         from .filelist import parse_fl_dat, detect_edata_prefix
+
+        # Separate system files from edata files
+        system_files = [(r, p) for r, p in self.changed_files
+                        if r.startswith("system/")]
+        edata_files = [(r, p) for r, p in self.changed_files
+                       if not r.startswith("system/")]
+
+        # Process system files first (plain copy, no encryption)
+        if system_files:
+            self._write_system_files_debugfs(system_files)
+
+        if not edata_files:
+            if system_files:
+                self.log("Only system files were modified (no encryption needed).",
+                         "success")
+            return
 
         self.log("Loading file list...", "info")
         entries = parse_fl_dat(self.fl_dat_path)
@@ -3706,14 +3819,14 @@ class StandaloneModPipeline(ModPipeline):
         entry_map = {e.path: e for e in entries}
         self.log(f"Loaded {len(entries)} fl.dat entries.", "info")
 
-        total = len(self.changed_files)
+        total = len(edata_files)
         ok = 0
         fail = 0
 
         self.on_progress(0, total, "Encrypting...")
         self.log(f"TOTAL_FILES={total}", "info")
 
-        for i, (rel_path, win_path) in enumerate(self.changed_files):
+        for i, (rel_path, win_path) in enumerate(edata_files):
             self._check_cancel()
 
             # Find fl.dat entry
@@ -3874,8 +3987,79 @@ class StandaloneModPipeline(ModPipeline):
             summary += " successfully"
             self.log(summary, "success")
 
-        self.log("CRC32 forgery: encrypted files match original fl.dat checksums.",
-                 "success")
+        if edata_files:
+            self.log("CRC32 forgery: encrypted files match original fl.dat checksums.",
+                     "success")
+
+    def _write_system_files_debugfs(self, system_files):
+        """Write modified system files directly into the ext4 image via debugfs.
+
+        These files are NOT encrypted — they live outside edata/ on the
+        filesystem and are not listed in fl.dat, so no CRC forgery is needed.
+        """
+        import os
+        import base64 as _b64
+
+        total = len(system_files)
+        self.log(f"Writing {total} system file(s) (no encryption)...", "info")
+        self.on_progress(0, total, "Writing system files...")
+        ok = 0
+        fail = 0
+
+        for i, (rel_path, win_path) in enumerate(system_files):
+            self._check_cancel()
+
+            # Convert system/jjpe/gen1/Game/file -> /jjpe/gen1/Game/file
+            fs_path = "/" + rel_path[len("system/"):]
+
+            with open(win_path, 'rb') as f:
+                content = f.read()
+
+            self.log(f"  System file: {fs_path} ({len(content)} bytes)", "info")
+
+            # Stage file, then write via debugfs
+            staging = f"{self._debugfs_tmp}/sys_{i:05d}.bin"
+            try:
+                enc_b64 = _b64.b64encode(content).decode()
+                if len(enc_b64) > 100000:
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(
+                        mode='w', suffix='.b64', delete=False,
+                        dir=os.environ.get('TEMP', os.environ.get('TMP', '.')),
+                    ) as tf:
+                        tf.write(enc_b64)
+                        tmp_win = tf.name
+                    wsl_tmp = self.executor.to_exec_path(tmp_win)
+                    try:
+                        self.executor.run(
+                            f"base64 -d '{wsl_tmp}' > '{staging}'",
+                            timeout=60)
+                    finally:
+                        os.unlink(tmp_win)
+                else:
+                    self.executor.run(
+                        f"echo '{enc_b64}' | base64 -d > '{staging}'",
+                        timeout=30)
+
+                # Write into image via debugfs
+                self._debugfs_run(
+                    f'rm "{fs_path}"', writable=True, timeout=30)
+                self._debugfs_run(
+                    f'write "{staging}" "{fs_path}"',
+                    writable=True, timeout=120)
+
+                self.log(f"  [OK] {fs_path}", "success")
+                ok += 1
+            except (CommandError, OSError) as e:
+                self.log(f"  [FAIL] {fs_path}: {e}", "error")
+                fail += 1
+
+            self.on_progress(i + 1, total, f"ok={ok} fail={fail}")
+
+        self.on_progress(total, total, "System files complete")
+        self.log(f"System files: {ok}/{total} written"
+                 f"{f' ({fail} failed)' if fail else ''}",
+                 "success" if fail == 0 else "error")
 
     def _verify_raw_image(self, wsl_img):
         """Spot-check modifications via debugfs dump (no mount needed).
@@ -4248,10 +4432,12 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
     """
 
     def __init__(self, device_path, output_path, fl_dat_path,
-                 log_cb, phase_cb, progress_cb, done_cb):
+                 log_cb, phase_cb, progress_cb, done_cb,
+                 full_dump=False):
         # Pass device_path as image_path (we override mount logic)
         super().__init__(device_path, output_path, fl_dat_path,
-                         log_cb, phase_cb, progress_cb, done_cb)
+                         log_cb, phase_cb, progress_cb, done_cb,
+                         full_dump=full_dump)
         self.device_path = device_path  # e.g. \\.\PHYSICALDRIVE2 or /dev/sdb
         self._ssd_mounted = False
         self._wsl_mount_device = None  # for Windows wsl --unmount
@@ -4286,6 +4472,11 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
             self.on_phase(1)  # Decrypt
             self._phase_decrypt_standalone()
             self._check_cancel()
+
+            # Full filesystem dump (if requested)
+            if self.full_dump:
+                self._phase_copy_full_filesystem()
+                self._check_cancel()
 
             self._succeeded = True
             self.on_phase(cleanup_phase)  # Cleanup
@@ -4601,7 +4792,8 @@ class DirectSSDModPipeline(StandaloneModPipeline):
 
         Unlike _phase_encrypt_standalone (which uses debugfs on a raw image),
         this writes encrypted files directly to the live-mounted ext4
-        filesystem via cp.
+        filesystem via cp.  System files (from system/ subfolder) are
+        written directly without encryption.
         """
         import os
         import re as _re
@@ -4610,15 +4802,31 @@ class DirectSSDModPipeline(StandaloneModPipeline):
         from .crypto import encrypt_file, crc32_buf, decrypt_file as _df
         from .filelist import parse_fl_dat, detect_edata_prefix
 
+        # Separate system files from edata files
+        system_files = [(r, p) for r, p in self.changed_files
+                        if r.startswith("system/")]
+        edata_files = [(r, p) for r, p in self.changed_files
+                       if not r.startswith("system/")]
+
+        mp = self.mount_point  # e.g. /mnt/wsl/PHYSICALDRIVE3p3
+
+        # Process system files first (plain copy, no encryption)
+        if system_files:
+            self._write_system_files_ssd(system_files, mp)
+
+        if not edata_files:
+            if system_files:
+                self.log("Only system files were modified (no encryption needed).",
+                         "success")
+            return
+
         self.log("Loading file list...", "info")
         entries = parse_fl_dat(self.fl_dat_path)
         edata_prefix = detect_edata_prefix(entries)
         entry_map = {e.path: e for e in entries}
         self.log(f"Loaded {len(entries)} fl.dat entries.", "info")
 
-        mp = self.mount_point  # e.g. /mnt/wsl/PHYSICALDRIVE3p3
-
-        total = len(self.changed_files)
+        total = len(edata_files)
         ok = 0
         fail = 0
 
@@ -4631,7 +4839,7 @@ class DirectSSDModPipeline(StandaloneModPipeline):
         self.log(f"TOTAL_FILES={total}", "info")
 
         try:
-            for i, (rel_path, win_path) in enumerate(self.changed_files):
+            for i, (rel_path, win_path) in enumerate(edata_files):
                 self._check_cancel()
 
                 full_path = f"{edata_prefix}{rel_path}"
@@ -4789,8 +4997,102 @@ class DirectSSDModPipeline(StandaloneModPipeline):
             summary += " successfully"
             self.log(summary, "success")
 
-        self.log("CRC32 forgery: encrypted files match original fl.dat checksums.",
-                 "success")
+        if edata_files:
+            self.log("CRC32 forgery: encrypted files match original fl.dat checksums.",
+                     "success")
+
+    def _write_system_files_ssd(self, system_files, mp):
+        """Write modified system files directly to the mounted SSD.
+
+        These files are NOT encrypted — they live outside edata/ on the
+        filesystem and are not listed in fl.dat, so no CRC forgery is needed.
+        Just cp them to the correct paths on the mounted filesystem.
+        """
+        import os
+        import base64 as _b64
+
+        total = len(system_files)
+        self.log(f"Writing {total} system file(s) (no encryption)...", "info")
+        self.on_progress(0, total, "Writing system files...")
+
+        tag = uuid.uuid4().hex[:8]
+        staging_dir = f"/var/tmp/jjp_sys_{tag}"
+        self.executor.run(f"mkdir -p '{staging_dir}'", timeout=10)
+
+        ok = 0
+        fail = 0
+
+        try:
+            for i, (rel_path, win_path) in enumerate(system_files):
+                self._check_cancel()
+
+                # Convert system/jjpe/gen1/Game/file -> /jjpe/gen1/Game/file
+                fs_path = "/" + rel_path[len("system/"):]
+                dest_path = f"{mp}{fs_path}"
+
+                with open(win_path, 'rb') as f:
+                    content = f.read()
+
+                self.log(f"  System file: {fs_path} ({len(content)} bytes)",
+                         "info")
+
+                staging = f"{staging_dir}/sys_{i:05d}.bin"
+                try:
+                    enc_b64 = _b64.b64encode(content).decode()
+                    if len(enc_b64) > 100000:
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(
+                            mode='w', suffix='.b64', delete=False,
+                            dir=os.environ.get('TEMP',
+                                               os.environ.get('TMP', '.')),
+                        ) as tf:
+                            tf.write(enc_b64)
+                            tmp_win = tf.name
+                        wsl_tmp = self.executor.to_exec_path(tmp_win)
+                        try:
+                            self.executor.run(
+                                f"base64 -d '{wsl_tmp}' > '{staging}'",
+                                timeout=60)
+                        finally:
+                            os.unlink(tmp_win)
+                    else:
+                        self.executor.run(
+                            f"echo '{enc_b64}' | base64 -d > '{staging}'",
+                            timeout=30)
+
+                    # Copy to mounted SSD
+                    self.executor.run(
+                        f"cp '{staging}' '{dest_path}'", timeout=120)
+
+                    # Verify
+                    disk_size = int(self.executor.run(
+                        f"stat -c%s '{dest_path}'", timeout=5).strip())
+                    if disk_size != len(content):
+                        self.log(
+                            f"  [FAIL] {fs_path} (size mismatch: "
+                            f"expected {len(content)}, got {disk_size})",
+                            "error")
+                        fail += 1
+                        continue
+
+                    self.log(f"  [OK] {fs_path}", "success")
+                    ok += 1
+                except (CommandError, OSError) as e:
+                    self.log(f"  [FAIL] {fs_path}: {e}", "error")
+                    fail += 1
+
+                self.on_progress(i + 1, total, f"ok={ok} fail={fail}")
+
+        finally:
+            try:
+                self.executor.run(f"rm -rf '{staging_dir}'", timeout=30)
+            except Exception:
+                pass
+
+        self.on_progress(total, total, "System files complete")
+        self.log(f"System files: {ok}/{total} written"
+                 f"{f' ({fail} failed)' if fail else ''}",
+                 "success" if fail == 0 else "error")
 
     # Reuse mount/unmount from DirectSSDDecryptPipeline
     _mount_ssd = DirectSSDDecryptPipeline._mount_ssd

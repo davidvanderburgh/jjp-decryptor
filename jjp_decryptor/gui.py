@@ -99,9 +99,11 @@ class _Tooltip:
         self._tip = tk.Toplevel(self._widget)
         self._tip.wm_overrideredirect(True)
         self._tip.wm_geometry(f"+{x}+{y}")
+        self._tip.configure(background=c["tooltip_bg"])
         label = tk.Label(self._tip, text=self.text, background=c["tooltip_bg"],
                          foreground=c["tooltip_fg"], relief="solid", borderwidth=1,
-                         font=(_SANS_FONT, 9), padx=6, pady=2)
+                         font=(_SANS_FONT, 9), padx=6, pady=2,
+                         wraplength=400, justify=tk.LEFT)
         label.pack()
 
     def _hide(self, event=None):
@@ -114,7 +116,7 @@ class MainWindow:
     """Single-window tkinter GUI with Decrypt, Modify, and Write tabs."""
 
     def __init__(self, root, on_check_prereqs, on_start, on_cancel,
-                 on_mod_apply=None, on_mod_cancel=None, on_clear_cache=None,
+                 on_mod_apply=None, on_mod_cancel=None,
                  on_theme_change=None, initial_theme=None,
                  on_install_prereqs=None,
                  on_import=None, on_export=None):
@@ -124,7 +126,6 @@ class MainWindow:
         self._on_cancel = on_cancel
         self._on_mod_apply = on_mod_apply
         self._on_mod_cancel = on_mod_cancel
-        self._on_clear_cache = on_clear_cache
         self._on_theme_change = on_theme_change
         self._on_install_prereqs = on_install_prereqs
         self._on_import = on_import
@@ -233,10 +234,6 @@ class MainWindow:
         style.configure("Help.TButton", font=(_SANS_FONT, 11), padding=(4, 0),
                          foreground=c["accent"], **_icon_base)
         style.map("Help.TButton", background=[("active", c["button"])])
-        _trash_font = ("Segoe MDL2 Assets", 12) if sys.platform == "win32" else (_SANS_FONT, 12)
-        style.configure("Trash.TButton", font=_trash_font, padding=(4, 0),
-                         foreground=c["error"], **_icon_base)
-        style.map("Trash.TButton", background=[("active", c["button"])])
         style.configure("TEntry", fieldbackground=c["field_bg"], foreground=c["fg"])
         style.configure("TCombobox", fieldbackground=c["field_bg"],
                          foreground=c["fg"], background=c["button"],
@@ -259,6 +256,10 @@ class MainWindow:
                   foreground=[("selected", c["accent"])])
         style.configure("TRadiobutton", background=c["bg"], foreground=c["fg"])
         style.map("TRadiobutton",
+                  background=[("active", c["bg"])],
+                  foreground=[("active", c["accent"])])
+        style.configure("TCheckbutton", background=c["bg"], foreground=c["fg"])
+        style.map("TCheckbutton",
                   background=[("active", c["bg"])],
                   foreground=[("active", c["accent"])])
         style.configure("Horizontal.TProgressbar",
@@ -377,12 +378,6 @@ class MainWindow:
                                      command=self._toggle_theme)
         self.theme_btn.pack(side=tk.RIGHT, padx=(0, 4))
         self._theme_tooltip = _Tooltip(self.theme_btn, "", lambda: self._current_theme)
-        _trash_icon = "\uE74D" if sys.platform == "win32" else "\U0001F5D1"
-        self.clear_cache_btn = ttk.Button(top_bar, text=_trash_icon, width=3,
-                                           style="Trash.TButton",
-                                           command=self._on_clear_cache)
-        self.clear_cache_btn.pack(side=tk.RIGHT, padx=(0, 4))
-        _Tooltip(self.clear_cache_btn, "Clear cached images", lambda: self._current_theme)
 
         self._build_prerequisites(main)
 
@@ -557,6 +552,22 @@ class MainWindow:
 
         # Show ISO frame initially
         self._decrypt_iso_frame.pack(fill=tk.X, in_=self._decrypt_content_area)
+
+        # Options
+        opts_row = ttk.Frame(parent)
+        opts_row.pack(fill=tk.X, pady=(0, 6))
+        self.full_dump_var = tk.BooleanVar(value=False)
+        self.full_dump_chk = ttk.Checkbutton(
+            opts_row,
+            text="Extract full filesystem (game binary, OS, libraries, configs)",
+            variable=self.full_dump_var)
+        self.full_dump_chk.pack(side=tk.LEFT)
+        _Tooltip(self.full_dump_chk,
+                 "Copy the entire ext4 partition (minus encrypted assets) to "
+                 "a 'system/' subfolder. Includes game binary, bash scripts, "
+                 "shared libraries, OS configs, and more. These files are "
+                 "unencrypted and can be modified freely.",
+                 lambda: self._current_theme)
 
         # Step indicators
         self._decrypt_step_row = ttk.Frame(parent)
