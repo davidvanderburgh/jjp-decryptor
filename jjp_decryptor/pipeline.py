@@ -2878,6 +2878,18 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
 
         game = self.game_name or ""
         edata_rel = f"jjpe/gen1/{game}/edata"
+        self.log(f"  Mount point: {mp}", "info")
+        self.log(f"  Game name: {game or '(not detected)'}", "info")
+        self.log(f"  Excluding edata at: {edata_rel}", "info")
+
+        # Log top-level contents for diagnostics
+        try:
+            top_ls = self.executor.run(
+                f"ls -1 '{mp}/' 2>/dev/null | head -30", timeout=10).strip()
+            self.log(f"  Mount root contents: {top_ls.replace(chr(10), ', ')}",
+                     "info")
+        except CommandError:
+            self.log("  Warning: could not list mount root", "info")
 
         # Exclude edata (already decrypted) and Linux virtual/special dirs
         # that can't be copied to NTFS
@@ -2907,15 +2919,18 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
         # Use verbose extract (tar xvf) to get per-entry progress via stream().
         tar_excludes = " ".join(
             f"--exclude='./{d}'" for d in excludes)
+        # Log the tar command for diagnostics
+        tar_cmd = (
+            f"cd '{mp}' && tar cf - "
+            f"{tar_excludes} "
+            f"--warning=no-file-changed "
+            f". 2>/tmp/jjp_tar_err.log "
+            f"| tar xvf - -C '{sys_out}/' 2>&1; true"
+        )
         try:
             copied = 0
             for line in self.executor.stream(
-                f"cd '{mp}' && tar cf - "
-                f"{tar_excludes} "
-                f"--warning=no-file-changed "
-                f". 2>/dev/null "
-                f"| tar xvf - -C '{sys_out}/' 2>&1; true",
-                timeout=config.COPY_TIMEOUT,
+                tar_cmd, timeout=config.COPY_TIMEOUT,
             ):
                 self._check_cancel()
                 if line.strip():
@@ -2928,6 +2943,17 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
         except CommandError:
             self.log("Some files could not be copied (permission errors "
                      "or special files skipped).", "info")
+
+        # Report any tar errors for diagnostics
+        if copied == 0:
+            try:
+                tar_err = self.executor.run(
+                    "cat /tmp/jjp_tar_err.log 2>/dev/null | head -20",
+                    timeout=10).strip()
+                if tar_err:
+                    self.log(f"tar errors: {tar_err}", "info")
+            except CommandError:
+                pass
 
         self.on_progress(total_entries or 1, total_entries or 1,
                          "System copy complete")
