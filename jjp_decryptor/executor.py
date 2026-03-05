@@ -66,6 +66,15 @@ class CommandExecutor:
         """Convert a host filesystem path to a path visible inside the executor."""
         raise NotImplementedError
 
+    def host_tmp_dir(self):
+        """Return a host-side temp directory whose files are visible to the executor.
+
+        For WSL/native executors this is just tempfile.gettempdir().
+        For Docker, it returns the cache dir that's bind-mounted as /tmp.
+        """
+        import tempfile
+        return tempfile.gettempdir()
+
     def kill(self):
         """Kill the currently running streaming process (for cancellation)."""
         with self._lock:
@@ -320,6 +329,10 @@ class DockerExecutor(CommandExecutor):
         base = os.path.expanduser("~/.cache/jjp_decryptor/tmp")
         os.makedirs(base, exist_ok=True)
         return base
+
+    def host_tmp_dir(self):
+        """Return the cache dir that's bind-mounted as /tmp in the container."""
+        return self._cache_dir()
 
     def _ensure_image(self):
         """Build the Docker image if it doesn't exist."""
