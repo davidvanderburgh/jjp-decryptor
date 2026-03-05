@@ -501,8 +501,13 @@ class DockerExecutor(CommandExecutor):
         """Convert a macOS host path to a container path.
 
         e.g. /Users/david/file.img -> /host/Users/david/file.img
+        Cache dir files map to /tmp/ (bind-mounted in start_container).
         """
         path = os.path.abspath(host_path)
+        cache = self._cache_dir()
+        if path.startswith(cache + os.sep) or path == cache:
+            rel = os.path.relpath(path, cache)
+            return f"/tmp/{rel}" if rel != "." else "/tmp"
         return f"/host{path}"
 
     def check_available(self):
