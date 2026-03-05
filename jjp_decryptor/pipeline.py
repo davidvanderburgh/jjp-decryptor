@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -1121,7 +1122,7 @@ class DecryptionPipeline:
         try:
             with tempfile.NamedTemporaryFile(
                 mode='w', suffix='.c', delete=False,
-                dir=os.environ.get('TEMP', os.environ.get('TMP', '.')),
+                dir=tempfile.gettempdir(),
             ) as tf:
                 tf.write(DECRYPT_C_SOURCE)
                 tmp_win = tf.name
@@ -1798,7 +1799,7 @@ class ModPipeline(DecryptionPipeline):
         try:
             with tempfile.NamedTemporaryFile(
                 mode='w', suffix='.c', delete=False,
-                dir=os.environ.get('TEMP', os.environ.get('TMP', '.')),
+                dir=tempfile.gettempdir(),
             ) as tf:
                 tf.write(ENCRYPT_C_SOURCE)
                 tmp_win = tf.name
@@ -3426,7 +3427,7 @@ class StandaloneModPipeline(ModPipeline):
             self.log("  ffmpeg not available — cannot resample", "error")
             return None
 
-        tmp_dir = os.environ.get('TEMP', os.environ.get('TMP', '.'))
+        tmp_dir = tempfile.gettempdir()
         src_tmp = None
         out_tmp = None
         try:
@@ -3634,7 +3635,7 @@ class StandaloneModPipeline(ModPipeline):
             self.log("  ffmpeg not available — cannot convert OGG", "error")
             return None
 
-        tmp_dir = os.environ.get('TEMP', os.environ.get('TMP', '.'))
+        tmp_dir = tempfile.gettempdir()
         src_tmp = None
         out_tmp = None
         try:
@@ -3700,7 +3701,7 @@ class StandaloneModPipeline(ModPipeline):
         if not self._ensure_ffmpeg():
             return content
 
-        tmp_dir = os.environ.get('TEMP', os.environ.get('TMP', '.'))
+        tmp_dir = tempfile.gettempdir()
         src_tmp = None
         orig_tmp = None
         out_tmp = None
@@ -3939,7 +3940,7 @@ class StandaloneModPipeline(ModPipeline):
                     import tempfile
                     with tempfile.NamedTemporaryFile(
                         mode='w', suffix='.b64', delete=False,
-                        dir=os.environ.get('TEMP', os.environ.get('TMP', '.')),
+                        dir=tempfile.gettempdir(),
                     ) as tf:
                         tf.write(enc_b64)
                         tmp_win = tf.name
@@ -4051,7 +4052,7 @@ class StandaloneModPipeline(ModPipeline):
                     import tempfile
                     with tempfile.NamedTemporaryFile(
                         mode='w', suffix='.b64', delete=False,
-                        dir=os.environ.get('TEMP', os.environ.get('TMP', '.')),
+                        dir=tempfile.gettempdir(),
                     ) as tf:
                         tf.write(enc_b64)
                         tmp_win = tf.name
