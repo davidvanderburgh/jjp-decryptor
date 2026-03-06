@@ -2498,9 +2498,9 @@ class ModPipeline(DecryptionPipeline):
             orig_chunk = f"{orig_mount}{partimag}/{chunk_name}"
 
             new_md5 = self.executor.run(
-                f"md5sum '{new_chunk}' | cut -d' ' -f1", timeout=60).strip()
+                f"md5sum '{new_chunk}' | cut -d' ' -f1", timeout=300).strip()
             orig_md5 = self.executor.run(
-                f"md5sum '{orig_chunk}' | cut -d' ' -f1", timeout=60).strip()
+                f"md5sum '{orig_chunk}' | cut -d' ' -f1", timeout=300).strip()
 
             self.executor.run(
                 f"umount -l '{orig_mount}' 2>/dev/null; "
@@ -3934,17 +3934,23 @@ class StandaloneModPipeline(ModPipeline):
             enc_b64 = _b64.b64encode(encrypted).decode()
             staging = f"{self._debugfs_tmp}/enc_{i:05d}.bin"
             expected_size = len(encrypted)
+            _step = "init"
             try:
-                # Write encrypted bytes to staging file in WSL
-                if len(enc_b64) > 100000:
+                # Write encrypted bytes to staging file in WSL.
+                # Always use temp file for data > 30 KB base64 to avoid
+                # hitting Windows CreateProcessW command-line limits.
+                if len(enc_b64) > 30000:
                     import tempfile
+                    _tmp_dir = self.executor.host_tmp_dir()
+                    _step = f"tempfile in {_tmp_dir}"
                     with tempfile.NamedTemporaryFile(
                         mode='w', suffix='.b64', delete=False,
-                        dir=self.executor.host_tmp_dir(),
+                        dir=_tmp_dir,
                     ) as tf:
                         tf.write(enc_b64)
                         tmp_win = tf.name
                     wsl_tmp = self.executor.to_exec_path(tmp_win)
+                    _step = f"base64 decode {tmp_win} -> {staging}"
                     try:
                         self.executor.run(
                             f"base64 -d '{wsl_tmp}' > '{staging}'",
@@ -3952,11 +3958,13 @@ class StandaloneModPipeline(ModPipeline):
                     finally:
                         os.unlink(tmp_win)
                 else:
+                    _step = f"echo base64 ({len(enc_b64)} chars) -> {staging}"
                     self.executor.run(
                         f"echo '{enc_b64}' | base64 -d > '{staging}'",
                         timeout=30)
 
                 # Verify staging file size
+                _step = f"stat {staging}"
                 actual_size = int(self.executor.run(
                     f"stat -c%s '{staging}'", timeout=5).strip())
                 if actual_size != expected_size:
@@ -3968,13 +3976,16 @@ class StandaloneModPipeline(ModPipeline):
                     continue
 
                 # Remove old file from image, write new one via debugfs
+                _step = f"debugfs rm {entry.path}"
                 self._debugfs_run(
                     f'rm "{entry.path}"', writable=True, timeout=30)
+                _step = f"debugfs write {staging} -> {entry.path}"
                 self._debugfs_run(
                     f'write "{staging}" "{entry.path}"',
                     writable=True, timeout=120)
 
                 # Verify file was written by checking size via debugfs stat
+                _step = f"debugfs stat {entry.path}"
                 stat_out = self._debugfs_run(
                     f'stat "{entry.path}"', timeout=15)
                 m = _re.search(r'Size:\s*(\d+)', stat_out)
@@ -4000,7 +4011,8 @@ class StandaloneModPipeline(ModPipeline):
                         'content_md5': _hl.md5(content).hexdigest(),
                     }
             except (CommandError, OSError) as e:
-                self.log(f"[FAIL] {rel_path} (write failed: {e})", "error")
+                self.log(f"[FAIL] {rel_path} (write failed at step "
+                         f"'{_step}': {e})", "error")
                 fail += 1
 
             self.on_progress(i + 1, total, f"ok={ok} fail={fail}")
@@ -4048,7 +4060,7 @@ class StandaloneModPipeline(ModPipeline):
             staging = f"{self._debugfs_tmp}/sys_{i:05d}.bin"
             try:
                 enc_b64 = _b64.b64encode(content).decode()
-                if len(enc_b64) > 100000:
+                if len(enc_b64) > 30000:
                     import tempfile
                     with tempfile.NamedTemporaryFile(
                         mode='w', suffix='.b64', delete=False,
@@ -4364,9 +4376,9 @@ class StandaloneModPipeline(ModPipeline):
             new_first = f"{output_prefix}aa"
             orig_first = f"{part_prefix}.aa"
             new_cksum = self.executor.run(
-                f"md5sum '{new_first}' | cut -d' ' -f1", timeout=60).strip()
+                f"md5sum '{new_first}' | cut -d' ' -f1", timeout=300).strip()
             orig_cksum = self.executor.run(
-                f"md5sum '{orig_first}' | cut -d' ' -f1", timeout=60).strip()
+                f"md5sum '{orig_first}' | cut -d' ' -f1", timeout=300).strip()
             if new_cksum == orig_cksum:
                 self.log(
                     "WARNING: New partition chunks are IDENTICAL to originals! "
@@ -4942,19 +4954,22 @@ class DirectSSDModPipeline(StandaloneModPipeline):
                 staging = f"{staging_dir}/enc_{i:05d}.bin"
                 expected_size = len(encrypted)
                 dest_path = f"{mp}{entry.path}"
+                _step = "init"
 
                 try:
-                    # Write encrypted bytes to staging file in WSL
-                    if len(enc_b64) > 100000:
+                    # Write encrypted bytes to staging file
+                    if len(enc_b64) > 30000:
                         import tempfile
+                        _tmp_dir = self.executor.host_tmp_dir()
+                        _step = f"tempfile in {_tmp_dir}"
                         with tempfile.NamedTemporaryFile(
                             mode='w', suffix='.b64', delete=False,
-                            dir=os.environ.get('TEMP',
-                                               os.environ.get('TMP', '.')),
+                            dir=_tmp_dir,
                         ) as tf:
                             tf.write(enc_b64)
                             tmp_win = tf.name
                         wsl_tmp = self.executor.to_exec_path(tmp_win)
+                        _step = f"base64 decode {tmp_win} -> {staging}"
                         try:
                             self.executor.run(
                                 f"base64 -d '{wsl_tmp}' > '{staging}'",
@@ -4962,11 +4977,14 @@ class DirectSSDModPipeline(StandaloneModPipeline):
                         finally:
                             os.unlink(tmp_win)
                     else:
+                        _step = (f"echo base64 ({len(enc_b64)} chars) "
+                                 f"-> {staging}")
                         self.executor.run(
                             f"echo '{enc_b64}' | base64 -d > '{staging}'",
                             timeout=30)
 
                     # Verify staging file size
+                    _step = f"stat {staging}"
                     actual_size = int(self.executor.run(
                         f"stat -c%s '{staging}'", timeout=5).strip())
                     if actual_size != expected_size:
@@ -4978,10 +4996,12 @@ class DirectSSDModPipeline(StandaloneModPipeline):
                         continue
 
                     # Copy encrypted file to mounted SSD filesystem
+                    _step = f"cp {staging} -> {dest_path}"
                     self.executor.run(
                         f"cp '{staging}' '{dest_path}'", timeout=120)
 
                     # Verify written file size
+                    _step = f"stat {dest_path}"
                     disk_size = int(self.executor.run(
                         f"stat -c%s '{dest_path}'", timeout=5).strip())
                     if disk_size != expected_size:
@@ -4997,7 +5017,8 @@ class DirectSSDModPipeline(StandaloneModPipeline):
                         self._file_tree_cb(rel_path, "Encrypted OK")
                     ok += 1
                 except (CommandError, OSError) as e:
-                    self.log(f"[FAIL] {rel_path} (write failed: {e})", "error")
+                    self.log(f"[FAIL] {rel_path} (write failed at step "
+                             f"'{_step}': {e})", "error")
                     fail += 1
 
                 self.on_progress(i + 1, total, f"ok={ok} fail={fail}")
@@ -5066,12 +5087,11 @@ class DirectSSDModPipeline(StandaloneModPipeline):
                 staging = f"{staging_dir}/sys_{i:05d}.bin"
                 try:
                     enc_b64 = _b64.b64encode(content).decode()
-                    if len(enc_b64) > 100000:
+                    if len(enc_b64) > 30000:
                         import tempfile
                         with tempfile.NamedTemporaryFile(
                             mode='w', suffix='.b64', delete=False,
-                            dir=os.environ.get('TEMP',
-                                               os.environ.get('TMP', '.')),
+                            dir=self.executor.host_tmp_dir(),
                         ) as tf:
                             tf.write(enc_b64)
                             tmp_win = tf.name
