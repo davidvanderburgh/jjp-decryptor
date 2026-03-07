@@ -64,6 +64,8 @@ MP = "{mp}"
 OUT_DIR = "{out_dir}"
 EDATA_DIR = "{edata_dir}"
 GAME_NAME = "{game_name}"
+EXTRACT_GRAPHICS = {extract_graphics}
+EXTRACT_SOUNDS = {extract_sounds}
 
 if HAS_FL_DAT:
     entries = parse_fl_dat("/tmp/fl_decrypted.dat")
@@ -106,6 +108,21 @@ else:
 
     prefix = detect_edata_prefix(entries)
     print("Scan complete: {{}} files found".format(len(entries)), flush=True)
+
+# Filter entries by selected categories
+if not EXTRACT_GRAPHICS or not EXTRACT_SOUNDS:
+    def _keep(e):
+        rel = e.path[len(prefix):] if prefix and e.path.startswith(prefix) else e.path
+        if rel.startswith("graphics/"):
+            return EXTRACT_GRAPHICS
+        if rel.startswith("sound/"):
+            return EXTRACT_SOUNDS
+        return True  # keep anything else (e.g. config files)
+    before = len(entries)
+    entries = [e for e in entries if _keep(e)]
+    if before != len(entries):
+        print("Filtered to {{}}/{{}} files by category selection".format(
+            len(entries), before), flush=True)
 
 total = len(entries)
 if total == 0:
@@ -2614,11 +2631,14 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
 
     def __init__(self, image_path, output_path, fl_dat_path,
                  log_cb, phase_cb, progress_cb, done_cb,
-                 full_dump=False):
+                 full_dump=False, extract_graphics=True,
+                 extract_sounds=True):
         super().__init__(image_path, output_path,
                          log_cb, phase_cb, progress_cb, done_cb)
         self.fl_dat_path = fl_dat_path  # can be None for fully dongle-free
         self.full_dump = full_dump
+        self.extract_graphics = extract_graphics
+        self.extract_sounds = extract_sounds
 
     def run(self):
         """Execute the standalone pipeline."""
@@ -2668,7 +2688,11 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
             self._detect_game()
 
             self.on_phase(2)  # Decrypt
-            self._phase_decrypt_standalone()
+            if self.extract_graphics or self.extract_sounds:
+                self._phase_decrypt_standalone()
+            else:
+                self.log("Skipping asset decryption (no graphics/sounds selected).",
+                         "info")
             self._check_cancel()
 
             # Full filesystem dump (if requested)
@@ -2783,6 +2807,8 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
             out_dir=wsl_out,
             edata_dir=edata_dir,
             game_name=game_name,
+            extract_graphics="True" if self.extract_graphics else "False",
+            extract_sounds="True" if self.extract_sounds else "False",
         )
 
         # Write script to WSL /tmp
@@ -4488,11 +4514,14 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
 
     def __init__(self, device_path, output_path, fl_dat_path,
                  log_cb, phase_cb, progress_cb, done_cb,
-                 full_dump=False):
+                 full_dump=False, extract_graphics=True,
+                 extract_sounds=True):
         # Pass device_path as image_path (we override mount logic)
         super().__init__(device_path, output_path, fl_dat_path,
                          log_cb, phase_cb, progress_cb, done_cb,
-                         full_dump=full_dump)
+                         full_dump=full_dump,
+                         extract_graphics=extract_graphics,
+                         extract_sounds=extract_sounds)
         self.device_path = device_path  # e.g. \\.\PHYSICALDRIVE2 or /dev/sdb
         self._ssd_mounted = False
         self._wsl_mount_device = None  # for Windows wsl --unmount

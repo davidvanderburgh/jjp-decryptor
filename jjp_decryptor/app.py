@@ -444,6 +444,15 @@ class App:
                 "Please select an output folder.")
             return
 
+        # At least one category must be selected
+        if (not self.window.extract_graphics_var.get() and
+                not self.window.extract_sounds_var.get() and
+                not self.window.full_dump_var.get()):
+            messagebox.showwarning("Nothing Selected",
+                "Please select at least one category to extract "
+                "(Graphics, Sounds, or File System).")
+            return
+
         # Warn if output folder already has decrypted content
         if os.path.isdir(output_path) and os.listdir(output_path):
             proceed = messagebox.askyesno(
@@ -483,10 +492,14 @@ class App:
         log_cb("No dongle, chroot, or gcc required.", "success")
 
         full_dump = self.window.full_dump_var.get()
+        extract_graphics = self.window.extract_graphics_var.get()
+        extract_sounds = self.window.extract_sounds_var.get()
         self.pipeline = StandaloneDecryptPipeline(
             image_path, output_path, fl_dat_path,
             log_cb, phase_cb, progress_cb, done_cb,
             full_dump=full_dump,
+            extract_graphics=extract_graphics,
+            extract_sounds=extract_sounds,
         )
         threading.Thread(target=self.pipeline.run, daemon=True).start()
 
@@ -557,10 +570,14 @@ class App:
         log_cb("Direct SSD mode \u2014 no ISO extraction needed.", "success")
 
         full_dump = self.window.full_dump_var.get()
+        extract_graphics = self.window.extract_graphics_var.get()
+        extract_sounds = self.window.extract_sounds_var.get()
         self.pipeline = DirectSSDDecryptPipeline(
             device.device_id, output_path, fl_dat_path,
             log_cb, phase_cb, progress_cb, done_cb,
             full_dump=full_dump,
+            extract_graphics=extract_graphics,
+            extract_sounds=extract_sounds,
         )
         threading.Thread(target=self.pipeline.run, daemon=True).start()
 

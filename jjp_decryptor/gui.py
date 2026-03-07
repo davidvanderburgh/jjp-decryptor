@@ -553,13 +553,32 @@ class MainWindow:
         # Show ISO frame initially
         self._decrypt_iso_frame.pack(fill=tk.X, in_=self._decrypt_content_area)
 
-        # Options
+        # Options — what to extract
+        opts_label = ttk.Label(parent, text="Extract:", foreground=c["gray"])
+        opts_label.pack(anchor=tk.W, pady=(0, 2))
         opts_row = ttk.Frame(parent)
         opts_row.pack(fill=tk.X, pady=(0, 6))
+        self.extract_graphics_var = tk.BooleanVar(value=True)
+        self.extract_graphics_chk = ttk.Checkbutton(
+            opts_row, text="Graphics",
+            variable=self.extract_graphics_var)
+        self.extract_graphics_chk.pack(side=tk.LEFT, padx=(0, 12))
+        _Tooltip(self.extract_graphics_chk,
+                 "Decrypt and extract graphics assets (images, videos, "
+                 "animations, fonts).",
+                 lambda: self._current_theme)
+        self.extract_sounds_var = tk.BooleanVar(value=True)
+        self.extract_sounds_chk = ttk.Checkbutton(
+            opts_row, text="Sounds",
+            variable=self.extract_sounds_var)
+        self.extract_sounds_chk.pack(side=tk.LEFT, padx=(0, 12))
+        _Tooltip(self.extract_sounds_chk,
+                 "Decrypt and extract sound assets (music, sound effects, "
+                 "voice clips).",
+                 lambda: self._current_theme)
         self.full_dump_var = tk.BooleanVar(value=False)
         self.full_dump_chk = ttk.Checkbutton(
-            opts_row,
-            text="Extract full filesystem (game binary, OS, libraries, configs)",
+            opts_row, text="File System",
             variable=self.full_dump_var)
         self.full_dump_chk.pack(side=tk.LEFT)
         _Tooltip(self.full_dump_chk,
