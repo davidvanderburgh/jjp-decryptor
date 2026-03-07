@@ -2920,11 +2920,19 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
         # Use verbose extract (tar xvf) to get per-entry progress via stream().
         tar_excludes = " ".join(
             f"--exclude='./{d}'" for d in excludes)
-        # Log the tar command for diagnostics
+        # --warning is GNU tar only; detect before using
+        tar_warn = ""
+        try:
+            self.executor.run(
+                "tar --warning=no-file-changed -cf /dev/null /dev/null "
+                "2>/dev/null", timeout=5)
+            tar_warn = "--warning=no-file-changed "
+        except CommandError:
+            pass
         tar_cmd = (
             f"cd '{mp}' && tar cf - "
             f"{tar_excludes} "
-            f"--warning=no-file-changed "
+            f"{tar_warn}"
             f". 2>/tmp/jjp_tar_err.log "
             f"| tar xvf - -C '{sys_out}/' 2>&1; true"
         )
@@ -2952,7 +2960,15 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
                     "cat /tmp/jjp_tar_err.log 2>/dev/null | head -20",
                     timeout=10).strip()
                 if tar_err:
-                    self.log(f"tar errors: {tar_err}", "info")
+                    self.log(f"tar create errors: {tar_err}", "info")
+            except CommandError:
+                pass
+            # Also check if the extract side had issues
+            try:
+                test = self.executor.run(
+                    f"ls -la '{sys_out}/' 2>&1 | head -5",
+                    timeout=10).strip()
+                self.log(f"sys_out contents: {test}", "info")
             except CommandError:
                 pass
 

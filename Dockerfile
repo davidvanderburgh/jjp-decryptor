@@ -17,6 +17,7 @@ RUN apk add --no-cache \
     e2fsprogs-extra \
     pigz \
     coreutils \
+    tar \
     rsync \
     util-linux \
     findmnt
