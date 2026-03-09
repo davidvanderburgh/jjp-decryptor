@@ -1757,8 +1757,9 @@ class ModPipeline(DecryptionPipeline):
 
         self.log(f"Loaded {len(saved)} baseline checksums.", "info")
 
-        # Collect files to scan (only those in the original checksums)
+        # Collect files to scan
         all_files = []
+        untracked_system = 0
         for root, _dirs, files in os.walk(self.assets_folder):
             for name in files:
                 if name.startswith('.') or name == 'fl_decrypted.dat' or name.endswith('.img'):
@@ -1767,6 +1768,16 @@ class ModPipeline(DecryptionPipeline):
                 rel_path = os.path.relpath(full_path, self.assets_folder).replace('\\', '/')
                 if rel_path in saved:
                     all_files.append((rel_path, full_path))
+                elif rel_path.startswith("system/"):
+                    untracked_system += 1
+
+        if untracked_system > 0:
+            self.log(
+                f"Note: {untracked_system} system file(s) are not tracked "
+                f"in .checksums.md5.\n"
+                f"Re-run Decrypt with 'File System' checked to enable "
+                f"system file modification tracking.",
+                "info")
 
         total = len(all_files)
         self.on_progress(0, total, "Scanning...")
@@ -2700,6 +2711,12 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
                 self._phase_copy_full_filesystem()
                 self._check_cancel()
 
+            # Generate checksums AFTER all files (assets + system) are in
+            # the output folder, so the mod pipeline can detect changes to
+            # any of them.
+            wsl_out = self.executor.to_exec_path(self.output_path)
+            self._generate_checksums(wsl_out)
+
             self._succeeded = True
             self.on_phase(cleanup_phase)  # Cleanup
             self._phase_cleanup_standalone()
@@ -2880,10 +2897,6 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
             f"out of {final_total} files.",
             "success" if final_fail == 0 else "info",
         )
-
-        # Generate checksums for future modification comparison
-        wsl_out = self.executor.to_exec_path(self.output_path)
-        self._generate_checksums(wsl_out)
 
     def _phase_copy_full_filesystem(self):
         """Copy all non-edata files from the mounted filesystem to output/system/.
@@ -4561,6 +4574,12 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
             if self.full_dump:
                 self._phase_copy_full_filesystem()
                 self._check_cancel()
+
+            # Generate checksums AFTER all files (assets + system) are in
+            # the output folder, so the mod pipeline can detect changes to
+            # any of them.
+            wsl_out = self.executor.to_exec_path(self.output_path)
+            self._generate_checksums(wsl_out)
 
             self._succeeded = True
             self.on_phase(cleanup_phase)  # Cleanup
