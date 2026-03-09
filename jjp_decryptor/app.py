@@ -651,15 +651,11 @@ class App:
         def done_cb(success, summary):
             self.msg_queue.put(DoneMsg(success, summary))
 
-        if not fl_dat_path:
-            messagebox.showerror(
-                "Missing File List",
-                "No fl_decrypted.dat found in the output folder.\n\n"
-                "Decrypt your game first to generate the file list, then try "
-                "again.")
-            return
-
-        log_cb(f"Using cached file list: {fl_dat_path}", "success")
+        if fl_dat_path:
+            log_cb(f"Using cached file list: {fl_dat_path}", "success")
+        else:
+            log_cb("No fl_decrypted.dat found — only system file mods "
+                   "are supported without it.", "info")
         log_cb("No dongle, chroot, or gcc required.", "success")
         self.pipeline = StandaloneModPipeline(
             image_path, output_path, fl_dat_path,
@@ -699,14 +695,6 @@ class App:
             return
 
         fl_dat_path = self._find_fl_dat(output_path)
-        if not fl_dat_path:
-            messagebox.showerror(
-                "Missing File List",
-                "No fl_decrypted.dat found in the output folder.\n\n"
-                "Decrypt your game first to generate the file list, then try "
-                "again.")
-            return
-
         # Confirm device selection — this modifies a physical drive
         proceed = messagebox.askyesno(
             "Confirm Direct SSD Modification",
@@ -739,7 +727,11 @@ class App:
         def done_cb(success, summary):
             self.msg_queue.put(DoneMsg(success, summary))
 
-        log_cb(f"Using cached file list: {fl_dat_path}", "success")
+        if fl_dat_path:
+            log_cb(f"Using cached file list: {fl_dat_path}", "success")
+        else:
+            log_cb("No fl_decrypted.dat found — only system file mods "
+                   "are supported without it.", "info")
         log_cb("Direct SSD mod mode \u2014 writing directly to drive.", "info")
 
         self.pipeline = DirectSSDModPipeline(

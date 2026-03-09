@@ -3893,6 +3893,13 @@ class StandaloneModPipeline(ModPipeline):
                          "success")
             return
 
+        if not self.fl_dat_path:
+            raise PipelineError("Encrypt",
+                f"Found {len(edata_files)} modified asset file(s) that need "
+                f"encryption, but no fl_decrypted.dat is available.\n\n"
+                f"Decrypt with Graphics/Sounds checked first to generate "
+                f"the file list, then try again.")
+
         self.log("Loading file list...", "info")
         entries = parse_fl_dat(self.fl_dat_path)
         edata_prefix = detect_edata_prefix(entries)
@@ -4164,8 +4171,14 @@ class StandaloneModPipeline(ModPipeline):
 
         Raises PipelineError if verification fails — the ISO would be broken.
         """
-        # Pick the first changed file for a quick spot-check
-        rel_path, win_path = self.changed_files[0]
+        # Pick the first changed edata file for a quick spot-check
+        edata_changed = [(r, p) for r, p in self.changed_files
+                         if not r.startswith("system/")]
+        if not edata_changed:
+            self.log("Only system files modified — skipping encrypted "
+                     "file verification.", "info")
+            return
+        rel_path, win_path = edata_changed[0]
         from .filelist import parse_fl_dat, detect_edata_prefix
         entries = parse_fl_dat(self.fl_dat_path)
         edata_prefix = detect_edata_prefix(entries)
@@ -4922,6 +4935,13 @@ class DirectSSDModPipeline(StandaloneModPipeline):
                 self.log("Only system files were modified (no encryption needed).",
                          "success")
             return
+
+        if not self.fl_dat_path:
+            raise PipelineError("Encrypt",
+                f"Found {len(edata_files)} modified asset file(s) that need "
+                f"encryption, but no fl_decrypted.dat is available.\n\n"
+                f"Decrypt with Graphics/Sounds checked first to generate "
+                f"the file list, then try again.")
 
         self.log("Loading file list...", "info")
         entries = parse_fl_dat(self.fl_dat_path)
