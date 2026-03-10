@@ -801,14 +801,14 @@ class MainWindow:
         # Options row
         opts_row = ttk.Frame(cfg_frame)
         opts_row.pack(fill=tk.X, pady=(4, 0))
-        self.skip_duration_var = tk.BooleanVar(value=False)
+        self.skip_duration_var = tk.BooleanVar(value=True)
         cb = ttk.Checkbutton(opts_row, text="Keep original audio length",
                              variable=self.skip_duration_var)
         cb.pack(side=tk.LEFT)
-        _Tooltip(cb, "Skip automatic duration matching — replacement audio "
-                 "files keep their original length instead of being trimmed "
-                 "or padded to match the game's original duration. Useful "
-                 "for song loops and music tracks.",
+        _Tooltip(cb, "Replacement audio files keep their original length "
+                 "instead of being trimmed or padded to match the game's "
+                 "original duration. Disabling this may cause boot loops "
+                 "on some games.",
                  _tf)
 
         self._write_cfg_frame = cfg_frame
