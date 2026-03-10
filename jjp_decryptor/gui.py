@@ -798,6 +798,19 @@ class MainWindow:
                    command=self._ssd_refresh_write_devices,
                    width=10).pack(side=tk.LEFT)
 
+        # Options row
+        opts_row = ttk.Frame(cfg_frame)
+        opts_row.pack(fill=tk.X, pady=(4, 0))
+        self.skip_duration_var = tk.BooleanVar(value=False)
+        cb = ttk.Checkbutton(opts_row, text="Keep original audio length",
+                             variable=self.skip_duration_var)
+        cb.pack(side=tk.LEFT)
+        _Tooltip(cb, "Skip automatic duration matching — replacement audio "
+                 "files keep their original length instead of being trimmed "
+                 "or padded to match the game's original duration. Useful "
+                 "for song loops and music tracks.",
+                 _tf)
+
         self._write_cfg_frame = cfg_frame
 
         # Conditional content area
@@ -811,9 +824,7 @@ class MainWindow:
         self._write_desc = ttk.Label(
             self._write_iso_frame,
             text="Re-encrypt changed files into the game image and build "
-                 "a new ISO for USB drive installation. Audio files are "
-                 "automatically trimmed or padded to match the original "
-                 "duration.",
+                 "a new ISO for USB drive installation.",
             foreground=c["gray"], wraplength=700, justify=tk.LEFT)
         self._write_desc.pack(anchor=tk.W, pady=(0, 6))
 
@@ -836,8 +847,7 @@ class MainWindow:
         self._write_ssd_desc = ttk.Label(
             self._write_ssd_frame,
             text="Re-encrypt changed files and write them directly "
-                 "to the game SSD. Audio files are automatically trimmed "
-                 "or padded to match the original duration.",
+                 "to the game SSD.",
             foreground=c["gray"], wraplength=700, justify=tk.LEFT)
         self._write_ssd_desc.pack(anchor=tk.W, pady=(0, 6))
 

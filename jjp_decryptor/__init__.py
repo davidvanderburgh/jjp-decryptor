@@ -1,3 +1,3 @@
 """JJP Asset Decryptor — decrypt and modify Jersey Jack Pinball game assets."""
 
-__version__ = "3.2.2"
+__version__ = "3.3.0"

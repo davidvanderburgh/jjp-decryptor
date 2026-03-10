@@ -3082,10 +3082,12 @@ class StandaloneModPipeline(ModPipeline):
     """
 
     def __init__(self, image_path, assets_folder, fl_dat_path,
-                 log_cb, phase_cb, progress_cb, done_cb):
+                 log_cb, phase_cb, progress_cb, done_cb,
+                 skip_duration_match=False):
         super().__init__(image_path, assets_folder,
                          log_cb, phase_cb, progress_cb, done_cb)
         self.fl_dat_path = fl_dat_path
+        self.skip_duration_match = skip_duration_match
 
     def run(self):
         """Execute the standalone mod pipeline."""
@@ -3538,7 +3540,13 @@ class StandaloneModPipeline(ModPipeline):
         Pure Python implementation — no ffmpeg needed. Truncates extra
         frames or pads with silence to match orig_fmt["nframes"].
         Returns resized WAV bytes, or original content on failure.
+        Skipped when skip_duration_match is True.
         """
+        if getattr(self, 'skip_duration_match', False):
+            self.log(f"  Duration matching skipped (keep original length)",
+                     "info")
+            return content
+
         import io as _io
         import wave
         from .audio import detect_wav_format
@@ -3748,7 +3756,13 @@ class StandaloneModPipeline(ModPipeline):
 
         Uses ffprobe to get durations, then ffmpeg to trim or pad.
         Returns resized OGG bytes, or original content on failure.
+        Skipped when skip_duration_match is True.
         """
+        if getattr(self, 'skip_duration_match', False):
+            self.log(f"  Duration matching skipped (keep original length)",
+                     "info")
+            return content
+
         import os
         import tempfile
         import base64 as _b64
@@ -4836,9 +4850,11 @@ class DirectSSDModPipeline(StandaloneModPipeline):
     """
 
     def __init__(self, device_path, assets_folder, fl_dat_path,
-                 log_cb, phase_cb, progress_cb, done_cb):
+                 log_cb, phase_cb, progress_cb, done_cb,
+                 skip_duration_match=False):
         super().__init__(device_path, assets_folder, fl_dat_path,
-                         log_cb, phase_cb, progress_cb, done_cb)
+                         log_cb, phase_cb, progress_cb, done_cb,
+                         skip_duration_match=skip_duration_match)
         self.device_path = device_path
         self._ssd_mounted = False
         self._wsl_mount_device = None

@@ -657,10 +657,15 @@ class App:
             log_cb("No fl_decrypted.dat found — only system file mods "
                    "are supported without it.", "info")
         log_cb("No dongle, chroot, or gcc required.", "success")
+        skip_duration = self.window.skip_duration_var.get()
         self.pipeline = StandaloneModPipeline(
             image_path, output_path, fl_dat_path,
             log_cb, phase_cb, progress_cb, done_cb,
+            skip_duration_match=skip_duration,
         )
+        if skip_duration:
+            log_cb("Audio duration matching disabled — files keep their "
+                   "original length.", "info")
 
         self.pipeline.log_link = lambda text, url: self.msg_queue.put(LinkMsg(text, url))
         self.pipeline._file_tree_cb = lambda rel_path, status: \
@@ -734,10 +739,15 @@ class App:
                    "are supported without it.", "info")
         log_cb("Direct SSD mod mode \u2014 writing directly to drive.", "info")
 
+        skip_duration = self.window.skip_duration_var.get()
         self.pipeline = DirectSSDModPipeline(
             device.device_id, output_path, fl_dat_path,
             log_cb, phase_cb, progress_cb, done_cb,
+            skip_duration_match=skip_duration,
         )
+        if skip_duration:
+            log_cb("Audio duration matching disabled — files keep their "
+                   "original length.", "info")
         self.pipeline.log_link = lambda text, url: self.msg_queue.put(LinkMsg(text, url))
         self.pipeline._file_tree_cb = lambda rel_path, status: \
             self.msg_queue.put(FileTreeMsg(rel_path, status))
