@@ -807,7 +807,7 @@ class MainWindow:
         cb.pack(side=tk.LEFT)
         _Tooltip(cb, "Replacement audio files keep their original length "
                  "instead of being trimmed or padded to match the game's "
-                 "original duration. Disabling this may cause boot loops "
+                 "original duration. Enabling this may cause boot loops "
                  "on some games.",
                  _tf)
 
