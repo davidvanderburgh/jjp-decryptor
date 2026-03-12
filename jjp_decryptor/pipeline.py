@@ -4620,10 +4620,87 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
             self._cleanup_ssd()
             self.on_done(False, f"Unexpected error: {e}")
 
+    def _detect_partition(self, device):
+        """Auto-detect the Linux/ext4 game partition number on the SSD.
+
+        Tries platform-specific methods, falls back to config default.
+        Returns the 1-indexed partition number.
+        """
+        from .executor import WslExecutor, DockerExecutor, NativeExecutor
+
+        if isinstance(self.executor, DockerExecutor):
+            # macOS: use diskutil list to find Linux partition
+            try:
+                rc, out, _ = self.executor.run_host(
+                    f"diskutil list {device}", timeout=10)
+                if rc == 0 and out:
+                    for line in out.splitlines():
+                        # Look for "Linux Filesystem" or "Linux" type partitions
+                        if 'Linux' in line:
+                            # Extract partition number from e.g. "disk3s2"
+                            m = re.search(r'disk\d+s(\d+)', line)
+                            if m:
+                                part = int(m.group(1))
+                                self.log(f"Auto-detected Linux partition: "
+                                         f"{device}s{part}", "info")
+                                return part
+            except Exception:
+                pass
+
+        elif isinstance(self.executor, WslExecutor):
+            # Windows: use PowerShell Get-Partition to find Linux partition
+            disk_num = device.rstrip().replace("\\\\", "\\").split(
+                "PHYSICALDRIVE")[-1]
+            if disk_num.isdigit():
+                try:
+                    rc, out, _ = self.executor.run_host(
+                        f'powershell -NoProfile -Command "'
+                        f"Get-Partition -DiskNumber {disk_num} | "
+                        f"Select-Object PartitionNumber, Type, Size | "
+                        f'Format-Table -AutoSize"',
+                        timeout=15)
+                    if rc == 0 and out:
+                        # Look for partitions with Unknown type (Linux/ext4)
+                        # or the largest partition (game data is typically
+                        # the biggest)
+                        for line in out.splitlines():
+                            m = re.match(r'\s*(\d+)\s+Unknown\s', line)
+                            if m:
+                                part = int(m.group(1))
+                                self.log(f"Auto-detected Linux partition: "
+                                         f"partition {part}", "info")
+                                return part
+                except Exception:
+                    pass
+
+        elif isinstance(self.executor, NativeExecutor):
+            # Linux: use lsblk to find ext4 partition
+            base = os.path.basename(device)  # e.g. sdb
+            try:
+                result = self.executor.run(
+                    f"lsblk -rno NAME,FSTYPE {device}", timeout=10)
+                for line in result.strip().splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1] == 'ext4':
+                        name = parts[0]  # e.g. sdb3
+                        m = re.search(r'(\d+)$', name)
+                        if m:
+                            part = int(m.group(1))
+                            self.log(f"Auto-detected ext4 partition: "
+                                     f"{device}{part}", "info")
+                            return part
+            except Exception:
+                pass
+
+        self.log(f"Could not auto-detect partition, using default "
+                 f"(partition {config.GAME_PARTITION_NUMBER})", "info")
+        return config.GAME_PARTITION_NUMBER
+
     def _mount_ssd(self, read_only=True):
         """Mount the SSD's game partition via platform-specific method."""
         from .executor import WslExecutor, DockerExecutor, NativeExecutor
-        part_num = config.GAME_PARTITION_NUMBER
+        part_num = self._detect_partition(self.device_path)
+        self._part_num = part_num  # save for cleanup writeback
 
         tag = uuid.uuid4().hex[:8]
         self.mount_point = f"{config.MOUNT_PREFIX}ssd_{tag}"
@@ -4945,7 +5022,7 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                 and self._ssd_image_path
                 and os.path.isfile(self._ssd_image_path)):
             device = self.device_path
-            part_num = config.GAME_PARTITION_NUMBER
+            part_num = getattr(self, '_part_num', config.GAME_PARTITION_NUMBER)
             raw_dev = device.replace("/dev/disk", "/dev/rdisk") + f"s{part_num}"
             self.log("Writing modified image back to SSD (this may take "
                      "several minutes)...", "info")
