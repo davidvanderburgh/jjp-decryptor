@@ -4566,6 +4566,8 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
         self._ssd_mounted = False
         self._wsl_mount_device = None  # for Windows wsl --unmount
         self._disk_was_offlined = False
+        self._ssd_image_path = None    # raw image of SSD partition (macOS)
+        self._needs_writeback = False   # write image back to SSD on success
 
     def run(self):
         """Execute the direct SSD decrypt pipeline."""
@@ -4579,15 +4581,6 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
             ok, msg = self.executor.check_path_accessible(self.output_path)
             if not ok:
                 raise PipelineError("Mount", f"Output folder path error:\n{msg}")
-
-            # Docker on macOS cannot pass through physical block devices
-            if isinstance(self.executor, DockerExecutor):
-                raise PipelineError("Mount",
-                    "Direct SSD mode is not supported on macOS.\n\n"
-                    "Docker Desktop runs inside a virtual machine and cannot "
-                    "access physical drives directly.\n\n"
-                    "Use 'Build USB ISO' instead to create a modified ISO, "
-                    "then flash it to the SSD from a Windows or Linux machine.")
 
             self.on_phase(0)  # Mount
             self._mount_ssd(read_only=True)
@@ -4722,32 +4715,123 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                     f"Could not find SSD mount point: {e.output}") from e
 
         elif isinstance(self.executor, DockerExecutor):
-            # macOS: SSD must be unmounted from macOS, then accessed in Docker
+            # macOS: Docker can't access host block devices directly.
+            # Copy the partition to a raw image file via dd on the host,
+            # then process the image inside Docker.
             device = self.device_path  # e.g. /dev/disk2
+            dev_partition = f"{device}s{part_num}"
+            # Use raw device for faster reads
+            raw_dev = device.replace("/dev/disk", "/dev/rdisk") + f"s{part_num}"
             self.log(f"Preparing {device} for Docker access...", "info")
 
             # Unmount from macOS first
             rc, stdout, stderr = self.executor.run_host(
                 f"diskutil unmountDisk {device}", timeout=15)
             if rc != 0:
-                self.log(f"Warning: could not unmount {device}: {stderr}", "info")
+                self.log(f"Warning: could not unmount {device}: {stderr}",
+                         "info")
 
-            # Mount partition inside container
-            # Docker needs the device passed through; the container is already
-            # started with --privileged so it can see /dev/ devices
-            dev_partition = f"{device}s{part_num}"
-            mount_opts = "ro" if read_only else "rw"
+            # Get partition size for logging
             try:
-                self.executor.run(f"mkdir -p {self.mount_point}", timeout=10)
-                self.executor.run(
-                    f"mount -t ext4 -o {mount_opts} '{dev_partition}' "
-                    f"{self.mount_point}",
-                    timeout=config.MOUNT_TIMEOUT)
-                self._ssd_mounted = True
-                self.log(f"SSD mounted at {self.mount_point}", "success")
-            except CommandError as e:
+                rc, info, _ = self.executor.run_host(
+                    f"diskutil info {dev_partition}", timeout=10)
+                import re as _re
+                m = _re.search(r'Disk Size:\s*([\d.]+ [A-Z]+)', info or "")
+                if m:
+                    self.log(f"Partition size: {m.group(1)}", "info")
+            except Exception:
+                pass
+
+            # dd the partition to a raw image in the cache dir
+            cache_dir = self.executor._cache_dir()
+            self._ssd_image_path = os.path.join(cache_dir, "ssd_partition.img")
+            if os.path.exists(self._ssd_image_path):
+                os.unlink(self._ssd_image_path)
+
+            self.log("Copying SSD partition to local image (this may take "
+                     "several minutes)...", "info")
+            rc, stdout, stderr = self.executor.run_host(
+                f"dd if='{raw_dev}' of='{self._ssd_image_path}' bs=1m",
+                timeout=3600)
+            if rc != 0:
                 raise PipelineError("Mount",
-                    f"Failed to mount SSD in Docker:\n{e.output}") from e
+                    f"Failed to read SSD partition via dd:\n"
+                    f"{stderr or stdout}\n\n"
+                    f"If permission denied, try: sudo python -m jjp_decryptor")
+
+            img_size = os.path.getsize(self._ssd_image_path)
+            self.log(f"Partition image: {img_size / (1024**3):.1f} GB",
+                     "success")
+
+            # Start Docker container with the image accessible
+            # (cache dir is bind-mounted as /tmp in the container)
+            host_paths = []
+            if hasattr(self, 'output_path'):
+                host_paths.append(self.output_path)
+            if hasattr(self, 'assets_folder'):
+                host_paths.append(self.assets_folder)
+            self.log("Starting Docker container...", "info")
+            self.executor.start_container(host_paths)
+            wsl_img = self.executor.to_exec_path(self._ssd_image_path)
+
+            if read_only:
+                # Decrypt mode: loop mount the image read-only
+                try:
+                    self.executor.run(
+                        f"mkdir -p {self.mount_point}", timeout=10)
+                    self.executor.run(
+                        f"mount -o loop,ro '{wsl_img}' {self.mount_point}",
+                        timeout=config.MOUNT_TIMEOUT)
+                    self._ssd_mounted = True
+                    self.log(f"Image mounted at {self.mount_point}", "success")
+                except CommandError as e:
+                    raise PipelineError("Mount",
+                        f"Failed to mount SSD image:\n{e.output}") from e
+            else:
+                # Modify mode: use debugfs (no mount needed)
+                self._wsl_img = wsl_img
+                tag = uuid.uuid4().hex[:8]
+                self._debugfs_tmp = f"/var/tmp/jjp_debugfs_{tag}"
+                self.executor.run(
+                    f"mkdir -p '{self._debugfs_tmp}'", timeout=10)
+
+                # Validate ext4
+                try:
+                    self._debugfs_run("stats", timeout=30)
+                    self.log("ext4 image validated.", "success")
+                except CommandError as e:
+                    raise PipelineError("Mount",
+                        f"SSD image is not a valid ext4 filesystem: "
+                        f"{e.output}") from e
+
+                # Detect game name via debugfs
+                try:
+                    result = self._debugfs_run(
+                        f"ls {config.GAME_BASE_PATH}", timeout=15)
+                    import re as _re2
+                    for name in _re2.findall(r'\(\d+\)\s+(\S+)', result):
+                        if name in ('.', '..'):
+                            continue
+                        try:
+                            stat_out = self._debugfs_run(
+                                f'stat "{config.GAME_BASE_PATH}/{name}/game"',
+                                timeout=10)
+                            if ('Inode:' in stat_out
+                                    or 'Type: regular' in stat_out):
+                                self.game_name = name
+                                display = config.KNOWN_GAMES.get(name, name)
+                                self.log(f"Detected game: {display} ({name})",
+                                         "success")
+                                break
+                        except CommandError:
+                            pass
+                except CommandError:
+                    pass
+
+                self.mount_point = None
+                self._ssd_mounted = True  # signal for cleanup
+                self.log("Image prepared for debugfs operations.", "success")
+                return  # skip validation below (no mount_point)
 
         elif isinstance(self.executor, NativeExecutor):
             # Linux: direct mount
@@ -4816,8 +4900,30 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                             f'"Set-Disk -Number {disk_num} -IsOffline $false"',
                             timeout=15)
                     self._disk_was_offlined = False
+            elif isinstance(self.executor, DockerExecutor):
+                # macOS Docker: unmount loop mount or clean debugfs tmp
+                if self.mount_point:
+                    try:
+                        self.executor.run(
+                            f"umount '{self.mount_point}' 2>/dev/null; true",
+                            timeout=30)
+                    except CommandError:
+                        pass
+                    try:
+                        self.executor.run(
+                            f"rmdir '{self.mount_point}' 2>/dev/null; true",
+                            timeout=5)
+                    except CommandError:
+                        pass
+                if hasattr(self, '_debugfs_tmp'):
+                    try:
+                        self.executor.run(
+                            f"rm -rf '{self._debugfs_tmp}' 2>/dev/null; true",
+                            timeout=10)
+                    except CommandError:
+                        pass
             else:
-                # macOS/Linux: unmount inside executor
+                # Linux: unmount inside executor
                 try:
                     self.executor.run(
                         f"umount '{self.mount_point}' 2>/dev/null; true",
@@ -4832,6 +4938,48 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                     pass
 
             self._ssd_mounted = False
+
+        # Write modified image back to SSD (macOS Docker modify mode)
+        if (getattr(self, '_needs_writeback', False)
+                and getattr(self, '_succeeded', False)
+                and self._ssd_image_path
+                and os.path.isfile(self._ssd_image_path)):
+            device = self.device_path
+            part_num = config.GAME_PARTITION_NUMBER
+            raw_dev = device.replace("/dev/disk", "/dev/rdisk") + f"s{part_num}"
+            self.log("Writing modified image back to SSD (this may take "
+                     "several minutes)...", "info")
+            # Unmount disk before writing
+            self.executor.run_host(
+                f"diskutil unmountDisk {device}", timeout=15)
+            rc, stdout, stderr = self.executor.run_host(
+                f"dd if='{self._ssd_image_path}' of='{raw_dev}' bs=1m",
+                timeout=3600)
+            if rc != 0:
+                self.log(f"WARNING: Failed to write image back to SSD!\n"
+                         f"{stderr or stdout}\n\n"
+                         f"The modified image is preserved at:\n"
+                         f"{self._ssd_image_path}\n"
+                         f"You can write it manually with:\n"
+                         f"  sudo dd if='{self._ssd_image_path}' "
+                         f"of='{raw_dev}' bs=1m",
+                         "error")
+            else:
+                self.executor.run_host("sync", timeout=30)
+                self.log("Image written back to SSD successfully.", "success")
+                self._writeback_ok = True
+
+        # Clean up temp image file
+        # Keep it only if writeback was needed but failed (so user can
+        # manually dd it)
+        writeback_failed = (getattr(self, '_needs_writeback', False)
+                            and not getattr(self, '_writeback_ok', False))
+        if (self._ssd_image_path and os.path.isfile(self._ssd_image_path)
+                and not writeback_failed):
+            try:
+                os.unlink(self._ssd_image_path)
+            except OSError:
+                pass
 
         # Stop Docker container if applicable
         if isinstance(self.executor, DockerExecutor):
@@ -4861,6 +5009,9 @@ class DirectSSDModPipeline(StandaloneModPipeline):
         self.device_path = device_path
         self._ssd_mounted = False
         self._wsl_mount_device = None
+        self._ssd_image_path = None
+        self._needs_writeback = False
+        self._disk_was_offlined = False
 
     def run(self):
         """Execute the direct SSD mod pipeline."""
@@ -4874,15 +5025,6 @@ class DirectSSDModPipeline(StandaloneModPipeline):
             ok, msg = self.executor.check_path_accessible(self.assets_folder)
             if not ok:
                 raise PipelineError("Scan", f"Assets folder path error:\n{msg}")
-
-            # Docker on macOS cannot pass through physical block devices
-            if isinstance(self.executor, DockerExecutor):
-                raise PipelineError("Scan",
-                    "Direct SSD mode is not supported on macOS.\n\n"
-                    "Docker Desktop runs inside a virtual machine and cannot "
-                    "access physical drives directly.\n\n"
-                    "Use 'Build USB ISO' instead to create a modified ISO, "
-                    "then flash it to the SSD from a Windows or Linux machine.")
 
             self.on_phase(0)  # Scan
             self._phase_scan()
@@ -4900,7 +5042,12 @@ class DirectSSDModPipeline(StandaloneModPipeline):
             self._check_cancel()
 
             self.on_phase(2)  # Encrypt
-            self._phase_encrypt_ssd()
+            if isinstance(self.executor, DockerExecutor):
+                # macOS: use debugfs to write to raw image (no mount)
+                self._phase_encrypt_standalone()
+                self._needs_writeback = True
+            else:
+                self._phase_encrypt_ssd()
             self._check_cancel()
 
             self._succeeded = True
