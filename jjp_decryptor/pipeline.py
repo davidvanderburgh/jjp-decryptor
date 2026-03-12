@@ -4584,7 +4584,7 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
             if isinstance(self.executor, DockerExecutor):
                 self.log("Starting Docker container...", "info")
                 self.executor.start_container([
-                    self.output_path, *_project_dirs()])
+                    self.output_path])
 
             self.on_phase(0)  # Mount
             self._mount_ssd(read_only=True)
@@ -4876,7 +4876,7 @@ class DirectSSDModPipeline(StandaloneModPipeline):
             if isinstance(self.executor, DockerExecutor):
                 self.log("Starting Docker container...", "info")
                 self.executor.start_container([
-                    self.assets_folder, *_project_dirs()])
+                    self.assets_folder])
 
             self.on_phase(0)  # Scan
             self._phase_scan()
