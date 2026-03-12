@@ -4580,11 +4580,14 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
             if not ok:
                 raise PipelineError("Mount", f"Output folder path error:\n{msg}")
 
-            # Start Docker container if on macOS
+            # Docker on macOS cannot pass through physical block devices
             if isinstance(self.executor, DockerExecutor):
-                self.log("Starting Docker container...", "info")
-                self.executor.start_container([
-                    self.output_path])
+                raise PipelineError("Mount",
+                    "Direct SSD mode is not supported on macOS.\n\n"
+                    "Docker Desktop runs inside a virtual machine and cannot "
+                    "access physical drives directly.\n\n"
+                    "Use 'Build USB ISO' instead to create a modified ISO, "
+                    "then flash it to the SSD from a Windows or Linux machine.")
 
             self.on_phase(0)  # Mount
             self._mount_ssd(read_only=True)
@@ -4872,11 +4875,14 @@ class DirectSSDModPipeline(StandaloneModPipeline):
             if not ok:
                 raise PipelineError("Scan", f"Assets folder path error:\n{msg}")
 
-            # Start Docker container if on macOS
+            # Docker on macOS cannot pass through physical block devices
             if isinstance(self.executor, DockerExecutor):
-                self.log("Starting Docker container...", "info")
-                self.executor.start_container([
-                    self.assets_folder])
+                raise PipelineError("Scan",
+                    "Direct SSD mode is not supported on macOS.\n\n"
+                    "Docker Desktop runs inside a virtual machine and cannot "
+                    "access physical drives directly.\n\n"
+                    "Use 'Build USB ISO' instead to create a modified ISO, "
+                    "then flash it to the SSD from a Windows or Linux machine.")
 
             self.on_phase(0)  # Scan
             self._phase_scan()
