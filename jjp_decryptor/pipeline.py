@@ -5472,6 +5472,7 @@ class DirectSSDModPipeline(StandaloneModPipeline):
                  "success" if fail == 0 else "error")
 
     # Reuse mount/unmount from DirectSSDDecryptPipeline
+    _detect_partition = DirectSSDDecryptPipeline._detect_partition
     _mount_ssd = DirectSSDDecryptPipeline._mount_ssd
     _cleanup_ssd = DirectSSDDecryptPipeline._cleanup_ssd
 
