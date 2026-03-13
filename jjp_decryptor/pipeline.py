@@ -4634,16 +4634,47 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                 rc, out, _ = self.executor.run_host(
                     f"diskutil list {device}", timeout=10)
                 if rc == 0 and out:
+                    self.log(f"diskutil list {device}:\n{out.strip()}", "info")
+                    # First pass: look for "Linux Filesystem" or "Linux" type
                     for line in out.splitlines():
-                        # Look for "Linux Filesystem" or "Linux" type partitions
                         if 'Linux' in line:
-                            # Extract partition number from e.g. "disk3s2"
                             m = re.search(r'disk\d+s(\d+)', line)
                             if m:
                                 part = int(m.group(1))
                                 self.log(f"Auto-detected Linux partition: "
                                          f"{device}s{part}", "info")
                                 return part
+                    # Second pass: find the largest non-EFI/non-boot partition
+                    # JJP SSDs have a small EFI + boot partition and a large
+                    # ext4 game partition
+                    best_part = None
+                    best_size = 0
+                    for line in out.splitlines():
+                        m = re.search(r'disk\d+s(\d+)', line)
+                        if not m:
+                            continue
+                        p = int(m.group(1))
+                        # Skip EFI system partitions
+                        if 'EFI' in line or 'Apple' in line:
+                            continue
+                        # Parse size — look for GB/TB values
+                        sz = re.search(
+                            r'(\d+(?:\.\d+)?)\s*(TB|GB|MB|KB)', line)
+                        if sz:
+                            val = float(sz.group(1))
+                            unit = sz.group(2)
+                            bytes_val = val * {
+                                'TB': 1e12, 'GB': 1e9,
+                                'MB': 1e6, 'KB': 1e3,
+                            }.get(unit, 1)
+                            if bytes_val > best_size:
+                                best_size = bytes_val
+                                best_part = p
+                    if best_part is not None:
+                        self.log(f"Auto-detected largest partition: "
+                                 f"{device}s{best_part} "
+                                 f"({best_size / 1e9:.1f} GB)", "info")
+                        return best_part
             except Exception:
                 pass
 
