@@ -4626,6 +4626,9 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
         self._ssd_image_path = None    # raw image of SSD partition (macOS)
         self._needs_writeback = False   # write image back to SSD on success
 
+    # Reuse debugfs runner from StandaloneModPipeline
+    _debugfs_run = StandaloneModPipeline._debugfs_run
+
     def run(self):
         """Execute the direct SSD decrypt pipeline."""
         from .executor import DockerExecutor
