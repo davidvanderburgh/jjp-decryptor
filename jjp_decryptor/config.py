@@ -133,6 +133,6 @@ GAME_PARTITION_NUMBER = 3
 if sys.platform == "win32":
     PREREQ_NAMES = ["WSL2", "partclone", "xorriso", "debugfs", "pigz", "ffmpeg"]
 elif sys.platform == "darwin":
-    PREREQ_NAMES = ["Docker", "partclone", "xorriso"]
+    PREREQ_NAMES = ["Docker", "partclone", "xorriso", "debugfs"]
 else:
     PREREQ_NAMES = ["System", "partclone", "xorriso", "debugfs", "pigz", "ffmpeg"]

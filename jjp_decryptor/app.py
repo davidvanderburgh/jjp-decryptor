@@ -218,24 +218,30 @@ class App:
 
     def _check_prereqs(self):
         """Run prerequisite checks in a background thread."""
+        if getattr(self, '_prereq_running', False):
+            return
+        self._prereq_running = True
         self.window.append_log("Checking prerequisites...", "info")
 
         def _run():
-            results = check_prerequisites(self.executor, standalone=True)
-            for name, passed, message in results:
-                self.msg_queue.put(LogMsg(
-                    f"  {name}: {'OK' if passed else 'MISSING'} - {message}",
-                    "success" if passed else "error",
-                ))
-                self.root.after(0, self.window.set_prereq, name, passed, message)
+            try:
+                results = check_prerequisites(self.executor, standalone=True)
+                for name, passed, message in results:
+                    self.msg_queue.put(LogMsg(
+                        f"  {name}: {'OK' if passed else 'MISSING'} - {message}",
+                        "success" if passed else "error",
+                    ))
+                    self.root.after(0, self.window.set_prereq, name, passed, message)
 
-            all_ok = all(p for _, p, _ in results)
-            if all_ok:
-                self.msg_queue.put(LogMsg("All prerequisites met.", "success"))
-            else:
-                self.msg_queue.put(LogMsg(
-                    "Some prerequisites are missing. Fix them before proceeding.",
-                    "error"))
+                all_ok = all(p for _, p, _ in results)
+                if all_ok:
+                    self.msg_queue.put(LogMsg("All prerequisites met.", "success"))
+                else:
+                    self.msg_queue.put(LogMsg(
+                        "Some prerequisites are missing. Fix them before proceeding.",
+                        "error"))
+            finally:
+                self._prereq_running = False
 
         threading.Thread(target=_run, daemon=True).start()
 

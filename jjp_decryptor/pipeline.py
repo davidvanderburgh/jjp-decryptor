@@ -14,6 +14,24 @@ from .resources import DECRYPT_C_SOURCE, ENCRYPT_C_SOURCE, STUB_C_SOURCE
 from .executor import CommandError, create_executor, find_usbipd
 
 
+def _find_native_debugfs():
+    """Find a native debugfs binary on macOS (from Homebrew e2fsprogs).
+
+    Returns the path to debugfs if available, or None.
+    """
+    # Homebrew ARM (Apple Silicon)
+    brew_arm = "/opt/homebrew/opt/e2fsprogs/sbin/debugfs"
+    if os.path.isfile(brew_arm):
+        return brew_arm
+    # Homebrew Intel
+    brew_intel = "/usr/local/opt/e2fsprogs/sbin/debugfs"
+    if os.path.isfile(brew_intel):
+        return brew_intel
+    import shutil
+    path = shutil.which("debugfs")
+    return path
+
+
 def _find_project_file(filename):
     """Locate a project-level file (e.g. partclone_to_raw.py).
 
@@ -354,24 +372,31 @@ class DecryptionPipeline:
                 lines.append("  Docker: (could not detect)")
 
         # Tool versions inside executor (WSL, Docker, or native)
-        tools = [
-            ("xorriso", "xorriso --version 2>&1 | head -1"),
-            ("partclone", "partclone.restore --version 2>&1 | head -1"),
-            ("pigz", "pigz --version 2>&1 | head -1"),
-            ("e2fsck", "e2fsck -V 2>&1 | head -1"),
-            ("base64", "base64 --version 2>&1 | head -1"),
-            ("gzip", "gzip --version 2>&1 | head -1"),
-            ("ffmpeg", "ffmpeg -version 2>&1 | head -1"),
-        ]
-        for name, cmd in tools:
-            try:
-                out = self.executor.run(cmd, timeout=5).strip()
-                if out:
-                    lines.append(f"  {name}: {out}")
-                else:
-                    lines.append(f"  {name}: (installed, no version)")
-            except Exception:
-                lines.append(f"  {name}: NOT FOUND")
+        # Skip tool checks if Docker container isn't running yet —
+        # tools are inside the container and can't be queried from the host.
+        from .executor import DockerExecutor
+        if isinstance(self.executor, DockerExecutor) and \
+                not self.executor._container_running:
+            lines.append("  (tools available inside Docker container)")
+        else:
+            tools = [
+                ("xorriso", "xorriso --version 2>&1 | head -1"),
+                ("partclone", "partclone.restore --version 2>&1 | head -1"),
+                ("pigz", "pigz --version 2>&1 | head -1"),
+                ("e2fsck", "e2fsck -V 2>&1 | head -1"),
+                ("base64", "base64 --version 2>&1 | head -1"),
+                ("gzip", "gzip --version 2>&1 | head -1"),
+                ("ffmpeg", "ffmpeg -version 2>&1 | head -1"),
+            ]
+            for name, cmd in tools:
+                try:
+                    out = self.executor.run(cmd, timeout=5).strip()
+                    if out:
+                        lines.append(f"  {name}: {out}")
+                    else:
+                        lines.append(f"  {name}: (installed, no version)")
+                except Exception:
+                    lines.append(f"  {name}: NOT FOUND")
 
         # Disk space on /tmp (where executor work happens)
         try:
@@ -3243,6 +3268,27 @@ class StandaloneModPipeline(ModPipeline):
         Returns:
             stdout string
         """
+        native = getattr(self, '_native_debugfs_path', None)
+        if native:
+            # Native mode: run debugfs on host directly against raw device
+            args = [native]
+            if writable:
+                args.append("-w")
+            args.extend(["-R", command, self._wsl_img])
+            try:
+                result = subprocess.run(
+                    args, capture_output=True, text=True,
+                    encoding='utf-8', errors='replace', timeout=timeout)
+            except subprocess.TimeoutExpired as e:
+                raise CommandError(
+                    f"debugfs -R '{command}'", -1,
+                    f"Timed out after {timeout}s") from e
+            output = (result.stdout or "") + (result.stderr or "")
+            if result.returncode != 0:
+                raise CommandError(
+                    f"debugfs -R '{command}'", result.returncode, output)
+            return output
+
         w = "-w " if writable else ""
         # Use single quotes around the image path (may contain spaces
         # on the WSL side, though unlikely for /var/tmp paths).
@@ -4005,44 +4051,51 @@ class StandaloneModPipeline(ModPipeline):
                 continue
 
             # Stage encrypted file, then write into image via debugfs
-            import base64 as _b64
             import hashlib as _hl
-            enc_b64 = _b64.b64encode(encrypted).decode()
             staging = f"{self._debugfs_tmp}/enc_{i:05d}.bin"
             expected_size = len(encrypted)
             _step = "init"
             try:
-                # Write encrypted bytes to staging file in WSL.
-                # Always use temp file for data > 30 KB base64 to avoid
-                # hitting Windows CreateProcessW command-line limits.
-                if len(enc_b64) > 30000:
-                    import tempfile
-                    _tmp_dir = self.executor.host_tmp_dir()
-                    _step = f"tempfile in {_tmp_dir}"
-                    with tempfile.NamedTemporaryFile(
-                        mode='w', suffix='.b64', delete=False,
-                        dir=_tmp_dir,
-                    ) as tf:
-                        tf.write(enc_b64)
-                        tmp_win = tf.name
-                    wsl_tmp = self.executor.to_exec_path(tmp_win)
-                    _step = f"base64 decode {tmp_win} -> {staging}"
-                    try:
-                        self.executor.run(
-                            f"base64 -d '{wsl_tmp}' > '{staging}'",
-                            timeout=60)
-                    finally:
-                        os.unlink(tmp_win)
+                native = getattr(self, '_native_debugfs_path', None)
+                if native:
+                    # Native mode: write binary directly to local temp file
+                    _step = f"write binary to {staging}"
+                    with open(staging, "wb") as sf:
+                        sf.write(encrypted)
+                    actual_size = os.path.getsize(staging)
                 else:
-                    _step = f"echo base64 ({len(enc_b64)} chars) -> {staging}"
-                    self.executor.run(
-                        f"echo '{enc_b64}' | base64 -d > '{staging}'",
-                        timeout=30)
+                    # Docker/WSL mode: stage via base64
+                    import base64 as _b64
+                    enc_b64 = _b64.b64encode(encrypted).decode()
+                    if len(enc_b64) > 30000:
+                        _tmp_dir = self.executor.host_tmp_dir()
+                        _step = f"tempfile in {_tmp_dir}"
+                        with tempfile.NamedTemporaryFile(
+                            mode='w', suffix='.b64', delete=False,
+                            dir=_tmp_dir,
+                        ) as tf:
+                            tf.write(enc_b64)
+                            tmp_win = tf.name
+                        wsl_tmp = self.executor.to_exec_path(tmp_win)
+                        _step = f"base64 decode {tmp_win} -> {staging}"
+                        try:
+                            self.executor.run(
+                                f"base64 -d '{wsl_tmp}' > '{staging}'",
+                                timeout=60)
+                        finally:
+                            os.unlink(tmp_win)
+                    else:
+                        _step = (f"echo base64 ({len(enc_b64)} chars) "
+                                 f"-> {staging}")
+                        self.executor.run(
+                            f"echo '{enc_b64}' | base64 -d > '{staging}'",
+                            timeout=30)
 
-                # Verify staging file size
-                _step = f"stat {staging}"
-                actual_size = int(self.executor.run(
-                    f"stat -c%s '{staging}'", timeout=5).strip())
+                    # Verify staging file size
+                    _step = f"stat {staging}"
+                    actual_size = int(self.executor.run(
+                        f"stat -c%s '{staging}'", timeout=5).strip())
+
                 if actual_size != expected_size:
                     self.log(
                         f"[FAIL] {rel_path} (staging size mismatch: "
@@ -4135,26 +4188,30 @@ class StandaloneModPipeline(ModPipeline):
             # Stage file, then write via debugfs
             staging = f"{self._debugfs_tmp}/sys_{i:05d}.bin"
             try:
-                enc_b64 = _b64.b64encode(content).decode()
-                if len(enc_b64) > 30000:
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(
-                        mode='w', suffix='.b64', delete=False,
-                        dir=self.executor.host_tmp_dir(),
-                    ) as tf:
-                        tf.write(enc_b64)
-                        tmp_win = tf.name
-                    wsl_tmp = self.executor.to_exec_path(tmp_win)
-                    try:
-                        self.executor.run(
-                            f"base64 -d '{wsl_tmp}' > '{staging}'",
-                            timeout=60)
-                    finally:
-                        os.unlink(tmp_win)
+                native = getattr(self, '_native_debugfs_path', None)
+                if native:
+                    with open(staging, "wb") as sf:
+                        sf.write(content)
                 else:
-                    self.executor.run(
-                        f"echo '{enc_b64}' | base64 -d > '{staging}'",
-                        timeout=30)
+                    enc_b64 = _b64.b64encode(content).decode()
+                    if len(enc_b64) > 30000:
+                        with tempfile.NamedTemporaryFile(
+                            mode='w', suffix='.b64', delete=False,
+                            dir=self.executor.host_tmp_dir(),
+                        ) as tf:
+                            tf.write(enc_b64)
+                            tmp_win = tf.name
+                        wsl_tmp = self.executor.to_exec_path(tmp_win)
+                        try:
+                            self.executor.run(
+                                f"base64 -d '{wsl_tmp}' > '{staging}'",
+                                timeout=60)
+                        finally:
+                            os.unlink(tmp_win)
+                    else:
+                        self.executor.run(
+                            f"echo '{enc_b64}' | base64 -d > '{staging}'",
+                            timeout=30)
 
                 # Write into image via debugfs
                 self._debugfs_run(
@@ -4586,23 +4643,34 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
             self._mount_ssd(read_only=True)
             self._check_cancel()
 
-            # Detect game name from the mount
-            self._detect_game()
+            native = getattr(self, '_native_debugfs_path', None)
+            if native:
+                # ── Native debugfs path (macOS, no Docker) ──
+                # Game detection already done in _mount_ssd.
 
-            self.on_phase(1)  # Decrypt
-            self._phase_decrypt_standalone()
-            self._check_cancel()
-
-            # Full filesystem dump (if requested)
-            if self.full_dump:
-                self._phase_copy_full_filesystem()
+                self.on_phase(1)  # Decrypt
+                self._phase_decrypt_native()
                 self._check_cancel()
 
-            # Generate checksums AFTER all files (assets + system) are in
-            # the output folder, so the mod pipeline can detect changes to
-            # any of them.
-            wsl_out = self.executor.to_exec_path(self.output_path)
-            self._generate_checksums(wsl_out)
+                if self.full_dump:
+                    self._phase_copy_full_filesystem_native()
+                    self._check_cancel()
+
+                self._generate_checksums_native()
+            else:
+                # ── Docker / WSL path ──
+                self._detect_game()
+
+                self.on_phase(1)  # Decrypt
+                self._phase_decrypt_standalone()
+                self._check_cancel()
+
+                if self.full_dump:
+                    self._phase_copy_full_filesystem()
+                    self._check_cancel()
+
+                wsl_out = self.executor.to_exec_path(self.output_path)
+                self._generate_checksums(wsl_out)
 
             self._succeeded = True
             self.on_phase(cleanup_phase)  # Cleanup
@@ -4620,6 +4688,320 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
             self._cleanup_ssd()
             self.on_done(False, f"Unexpected error: {e}")
 
+    def _phase_decrypt_native(self):
+        """Decrypt files using native debugfs + Python crypto (no Docker).
+
+        Uses debugfs to dump individual files from the raw SSD partition,
+        decrypts them in-process, and writes output directly to the host.
+        """
+        from .crypto import decrypt_file, detect_filler_size, crc32_buf
+        from .filelist import parse_fl_dat, detect_edata_prefix, \
+            FileEntry, write_fl_dat
+
+        out_dir = self.output_path
+        os.makedirs(out_dir, exist_ok=True)
+        game_name = self.game_name or ""
+        edata_dir = f"{config.GAME_BASE_PATH}/{game_name}/edata"
+
+        has_fl_dat = self.fl_dat_path and os.path.isfile(self.fl_dat_path)
+
+        if has_fl_dat:
+            entries = parse_fl_dat(self.fl_dat_path)
+            prefix = detect_edata_prefix(entries)
+            # Copy fl_dat to output
+            import shutil
+            fl_dest = os.path.join(out_dir, "fl_decrypted.dat")
+            if os.path.normpath(os.path.abspath(self.fl_dat_path)) != \
+               os.path.normpath(fl_dest):
+                shutil.copy2(self.fl_dat_path, fl_dest)
+            self.log("Using cached fl_decrypted.dat", "info")
+        else:
+            # Scan filesystem via debugfs to build file list
+            self.log("Scanning edata directory via debugfs...", "info")
+            entries = self._scan_edata_via_debugfs(edata_dir)
+            prefix = detect_edata_prefix(entries) if entries else ""
+            self.log(f"Scan complete: {len(entries)} files found", "info")
+
+        # Filter by category
+        if not self.extract_graphics or not self.extract_sounds:
+            def _keep(e):
+                rel = e.path[len(prefix):] if prefix and \
+                    e.path.startswith(prefix) else e.path
+                if rel.startswith("graphics/"):
+                    return self.extract_graphics
+                if rel.startswith("sound/"):
+                    return self.extract_sounds
+                return True
+            before = len(entries)
+            entries = [e for e in entries if _keep(e)]
+            if before != len(entries):
+                self.log(f"Filtered to {len(entries)}/{before} files by "
+                         f"category selection", "info")
+
+        total = len(entries)
+        if total == 0:
+            self.log("No files to decrypt.", "info")
+            return
+
+        self.log(f"TOTAL_FILES={total}", "info")
+        self.on_progress(0, total, "Decrypting...")
+
+        ok = fail = skip = 0
+        computed_entries = []
+        tmp_file = os.path.join(tempfile.gettempdir(),
+                                f"jjp_dump_{uuid.uuid4().hex[:8]}.bin")
+
+        try:
+            for i, e in enumerate(entries):
+                self._check_cancel()
+
+                # Dump file from SSD via debugfs
+                try:
+                    self._debugfs_run(
+                        f'dump "{e.path}" "{tmp_file}"', timeout=30)
+                except CommandError:
+                    skip += 1
+                    if (i + 1) % 100 == 0 or i + 1 == total:
+                        self.on_progress(
+                            i + 1, total,
+                            f"ok={ok} fail={fail} skip={skip}")
+                    continue
+
+                if not os.path.isfile(tmp_file):
+                    skip += 1
+                    continue
+
+                try:
+                    with open(tmp_file, "rb") as f:
+                        enc_data = f.read()
+
+                    if len(enc_data) <= e.filler_size:
+                        skip += 1
+                        continue
+
+                    content = decrypt_file(enc_data, e.filler_size, e.path)
+                    rel = e.path[len(prefix):] if prefix and \
+                        e.path.startswith(prefix) else e.path
+                    out_path = os.path.join(out_dir, rel)
+                    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                    with open(out_path, "wb") as f:
+                        f.write(content)
+
+                    if not has_fl_dat:
+                        n3 = crc32_buf(content)
+                        computed_entries.append(FileEntry(
+                            path=e.path, filler_size=e.filler_size,
+                            crc_encrypted=e.crc_encrypted,
+                            crc_decrypted=n3))
+                    ok += 1
+                except Exception as ex:
+                    self.log(f"[FAIL] {e.path}: {ex}", "error")
+                    fail += 1
+                finally:
+                    try:
+                        os.unlink(tmp_file)
+                    except OSError:
+                        pass
+
+                if (i + 1) % 100 == 0 or i + 1 == total:
+                    self.on_progress(
+                        i + 1, total,
+                        f"ok={ok} fail={fail} skip={skip}")
+        finally:
+            # Ensure temp file is removed
+            try:
+                os.unlink(tmp_file)
+            except OSError:
+                pass
+
+        if not has_fl_dat and computed_entries:
+            fl_out = os.path.join(out_dir, "fl_decrypted.dat")
+            write_fl_dat(computed_entries, fl_out)
+            self.log(f"Generated fl_decrypted.dat with "
+                     f"{len(computed_entries)} entries", "info")
+
+        self.on_progress(total, total, "Complete")
+        self.log(
+            f"Decryption finished: {ok} OK, {fail} failed "
+            f"out of {ok + fail + skip} files.",
+            "success" if fail == 0 else "info")
+
+    def _scan_edata_via_debugfs(self, edata_dir):
+        """Recursively scan edata directory via debugfs, building file list."""
+        from .crypto import detect_filler_size, crc32_buf
+        from .filelist import FileEntry
+
+        all_files = []
+        self._debugfs_ls_recursive(edata_dir, all_files)
+
+        self.log(f"Found {len(all_files)} files, detecting filler sizes...",
+                 "info")
+        self.log(f"TOTAL_FILES={len(all_files)}", "info")
+
+        entries = []
+        tmp_file = os.path.join(tempfile.gettempdir(),
+                                f"jjp_scan_{uuid.uuid4().hex[:8]}.bin")
+        try:
+            for idx, crypto_path in enumerate(all_files):
+                try:
+                    self._debugfs_run(
+                        f'dump "{crypto_path}" "{tmp_file}"', timeout=30)
+                    with open(tmp_file, "rb") as f:
+                        enc_data = f.read()
+                    os.unlink(tmp_file)
+                except (CommandError, OSError):
+                    continue
+
+                if len(enc_data) < 8:
+                    continue
+                filler_size = detect_filler_size(enc_data, crypto_path)
+                if filler_size < 0 or len(enc_data) <= filler_size:
+                    continue
+                n2 = crc32_buf(enc_data)
+                entries.append(FileEntry(
+                    path=crypto_path, filler_size=filler_size,
+                    crc_encrypted=n2, crc_decrypted=0))
+
+                if (idx + 1) % 500 == 0:
+                    self.log(f"  Scanned {idx + 1}/{len(all_files)}",
+                             "info")
+        finally:
+            try:
+                os.unlink(tmp_file)
+            except OSError:
+                pass
+
+        return entries
+
+    def _debugfs_ls_recursive(self, path, result_list):
+        """Recursively list files under a directory via debugfs."""
+        try:
+            output = self._debugfs_run(f'ls -p {path}', timeout=15)
+        except CommandError:
+            return
+        for line in output.splitlines():
+            # debugfs ls -p format: inode/type/name
+            # Pipe-separated: e.g. /123456/100644/filename/
+            parts = line.strip().split('/')
+            if len(parts) < 4:
+                continue
+            name = parts[3] if len(parts) > 3 else ""
+            if not name or name in ('.', '..'):
+                continue
+            entry_type = parts[2] if len(parts) > 2 else ""
+            full_path = f"{path}/{name}"
+            if entry_type.startswith('4'):
+                # Directory — recurse
+                self._debugfs_ls_recursive(full_path, result_list)
+            else:
+                # File
+                result_list.append(full_path)
+
+    def _phase_copy_full_filesystem_native(self):
+        """Copy non-edata system files via native debugfs dump."""
+        self.log("Full filesystem dump via native debugfs...", "info")
+        game_name = self.game_name or ""
+        edata_rel = f"jjpe/gen1/{game_name}/edata"
+        exclude_dirs = {edata_rel, "proc", "sys", "dev", "run", "tmp",
+                        "lost+found"}
+
+        all_files = []
+        self._debugfs_ls_recursive_filtered(
+            "/", all_files, exclude_dirs, prefix="")
+
+        total = len(all_files)
+        if total == 0:
+            self.log("No system files found.", "info")
+            return
+
+        self.log(f"Found {total} system entries to copy.", "info")
+        self.on_progress(0, total, "Copying system files...")
+
+        sys_dir = os.path.join(self.output_path, "system")
+        tmp_file = os.path.join(tempfile.gettempdir(),
+                                f"jjp_sys_{uuid.uuid4().hex[:8]}.bin")
+        copied = 0
+        try:
+            for i, fs_path in enumerate(all_files):
+                self._check_cancel()
+                out_path = os.path.join(sys_dir, fs_path.lstrip("/"))
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                try:
+                    self._debugfs_run(
+                        f'dump "{fs_path}" "{tmp_file}"', timeout=60)
+                    if os.path.isfile(tmp_file):
+                        import shutil
+                        shutil.move(tmp_file, out_path)
+                        copied += 1
+                except (CommandError, OSError):
+                    pass
+                if (i + 1) % 200 == 0 or i + 1 == total:
+                    self.on_progress(i + 1, total, f"Copied {copied} files")
+        finally:
+            try:
+                os.unlink(tmp_file)
+            except OSError:
+                pass
+
+        self.log(f"System dump complete: {copied} files copied.", "success")
+
+    def _debugfs_ls_recursive_filtered(self, path, result_list,
+                                       exclude_dirs, prefix=""):
+        """Recursively list files, skipping excluded directories."""
+        try:
+            output = self._debugfs_run(f'ls -p {path}', timeout=15)
+        except CommandError:
+            return
+        for line in output.splitlines():
+            parts = line.strip().split('/')
+            if len(parts) < 4:
+                continue
+            name = parts[3] if len(parts) > 3 else ""
+            if not name or name in ('.', '..'):
+                continue
+            entry_type = parts[2] if len(parts) > 2 else ""
+            full_path = f"{path}/{name}" if path != "/" else f"/{name}"
+            rel = full_path.lstrip("/")
+            if entry_type.startswith('4'):
+                if rel not in exclude_dirs:
+                    self._debugfs_ls_recursive_filtered(
+                        full_path, result_list, exclude_dirs, prefix)
+            else:
+                result_list.append(full_path)
+
+    def _generate_checksums_native(self):
+        """Generate .checksums.md5 using native Python hashlib."""
+        import hashlib
+        self.log("Generating checksums for asset tracking...", "info")
+        out_dir = self.output_path
+        checksum_file = os.path.join(out_dir, ".checksums.md5")
+        skip_names = {'.checksums.md5', 'fl_decrypted.dat'}
+        all_files = []
+        for dirpath, _dirnames, filenames in os.walk(out_dir):
+            for fname in filenames:
+                if fname.startswith('.') or fname in skip_names \
+                        or fname.endswith('.img'):
+                    continue
+                all_files.append(os.path.join(dirpath, fname))
+
+        total = len(all_files)
+        self.on_progress(0, total, "Checksumming...")
+        with open(checksum_file, "w") as ck:
+            for i, fpath in enumerate(all_files):
+                md5 = hashlib.md5()
+                with open(fpath, "rb") as f:
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
+                        md5.update(chunk)
+                rel = os.path.relpath(fpath, out_dir)
+                ck.write(f"{md5.hexdigest()}  ./{rel}\n")
+                if (i + 1) % 500 == 0 or i + 1 == total:
+                    self.on_progress(i + 1, total,
+                                     f"{i + 1}/{total} files")
+        self.log(f"Checksums generated for {total} files.", "success")
+
     def _detect_partition(self, device):
         """Auto-detect the Linux/ext4 game partition number on the SSD.
 
@@ -4635,18 +5017,42 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                     f"diskutil list {device}", timeout=10)
                 if rc == 0 and out:
                     self.log(f"diskutil list {device}:\n{out.strip()}", "info")
-                    # First pass: look for "Linux Filesystem" or "Linux" type
+                    # Collect all Linux partitions with their sizes
+                    linux_parts = []
                     for line in out.splitlines():
-                        if 'Linux' in line:
-                            m = re.search(r'disk\d+s(\d+)', line)
-                            if m:
-                                part = int(m.group(1))
-                                self.log(f"Auto-detected Linux partition: "
-                                         f"{device}s{part}", "info")
-                                return part
-                    # Second pass: find the largest non-EFI/non-boot partition
-                    # JJP SSDs have a small EFI + boot partition and a large
-                    # ext4 game partition
+                        if 'Linux' not in line:
+                            continue
+                        m = re.search(r'disk\d+s(\d+)', line)
+                        if not m:
+                            continue
+                        p = int(m.group(1))
+                        sz = re.search(
+                            r'(\d+(?:\.\d+)?)\s*(TB|GB|MB|KB)', line)
+                        bytes_val = 0
+                        if sz:
+                            val = float(sz.group(1))
+                            unit = sz.group(2)
+                            bytes_val = val * {
+                                'TB': 1e12, 'GB': 1e9,
+                                'MB': 1e6, 'KB': 1e3,
+                            }.get(unit, 1)
+                        linux_parts.append((p, bytes_val))
+
+                    if len(linux_parts) == 1:
+                        part = linux_parts[0][0]
+                        self.log(f"Auto-detected Linux partition: "
+                                 f"{device}s{part}", "info")
+                        return part
+                    elif len(linux_parts) > 1:
+                        # Multiple Linux partitions — pick the largest
+                        best_part, best_size = max(
+                            linux_parts, key=lambda x: x[1])
+                        self.log(f"Auto-detected largest Linux partition: "
+                                 f"{device}s{best_part} "
+                                 f"({best_size / 1e9:.1f} GB)", "info")
+                        return best_part
+
+                    # Fallback: find the largest non-EFI/non-boot partition
                     best_part = None
                     best_size = 0
                     for line in out.splitlines():
@@ -4654,10 +5060,8 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                         if not m:
                             continue
                         p = int(m.group(1))
-                        # Skip EFI system partitions
                         if 'EFI' in line or 'Apple' in line:
                             continue
-                        # Parse size — look for GB/TB values
                         sz = re.search(
                             r'(\d+(?:\.\d+)?)\s*(TB|GB|MB|KB)', line)
                         if sz:
@@ -4823,14 +5227,11 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                     f"Could not find SSD mount point: {e.output}") from e
 
         elif isinstance(self.executor, DockerExecutor):
-            # macOS: Docker can't access host block devices directly.
-            # Copy the partition to a raw image file via dd on the host,
-            # then process the image inside Docker.
+            # macOS: check for native debugfs (Homebrew e2fsprogs) to
+            # access the SSD directly without copying the partition.
             device = self.device_path  # e.g. /dev/disk2
             dev_partition = f"{device}s{part_num}"
-            # Use raw device for faster reads
             raw_dev = device.replace("/dev/disk", "/dev/rdisk") + f"s{part_num}"
-            self.log(f"Preparing {device} for Docker access...", "info")
 
             # Unmount from macOS first
             rc, stdout, stderr = self.executor.run_host(
@@ -4843,36 +5244,78 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
             try:
                 rc, info, _ = self.executor.run_host(
                     f"diskutil info {dev_partition}", timeout=10)
-                import re as _re
-                m = _re.search(r'Disk Size:\s*([\d.]+ [A-Z]+)', info or "")
+                m = re.search(r'Disk Size:\s*([\d.]+ [A-Z]+)', info or "")
                 if m:
                     self.log(f"Partition size: {m.group(1)}", "info")
             except Exception:
                 pass
 
-            # dd the partition to a raw image in the cache dir
-            cache_dir = self.executor._cache_dir()
-            self._ssd_image_path = os.path.join(cache_dir, "ssd_partition.img")
-            if os.path.exists(self._ssd_image_path):
-                os.unlink(self._ssd_image_path)
+            native_debugfs = _find_native_debugfs()
+            if native_debugfs:
+                # ── Native debugfs mode ──
+                # Access the SSD partition directly via debugfs on the host.
+                # No Docker, no partition copy — like WSL on Windows.
+                self._native_debugfs_path = native_debugfs
+                self._wsl_img = raw_dev  # debugfs operates on raw device
+                self._ssd_image_path = None
+                self._ssd_image_on_host = True
+                self._needs_writeback = False  # changes are direct
 
-            self.log("Copying SSD partition to local image (this may take "
-                     "several minutes)...", "info")
-            rc, stdout, stderr = self.executor.run_host(
-                f"dd if='{raw_dev}' of='{self._ssd_image_path}' bs=1m",
-                timeout=3600)
-            if rc != 0:
-                raise PipelineError("Mount",
-                    f"Failed to read SSD partition via dd:\n"
-                    f"{stderr or stdout}\n\n"
-                    f"If permission denied, try: sudo python -m jjp_decryptor")
+                self.log(f"Using native debugfs: {native_debugfs}", "info")
 
-            img_size = os.path.getsize(self._ssd_image_path)
-            self.log(f"Partition image: {img_size / (1024**3):.1f} GB",
-                     "success")
+                # Validate ext4
+                try:
+                    self._debugfs_run("stats", timeout=30)
+                    self.log("ext4 filesystem validated.", "success")
+                except CommandError as e:
+                    raise PipelineError("Mount",
+                        f"Cannot read ext4 filesystem on {raw_dev}:\n"
+                        f"{e.output}\n\n"
+                        f"If permission denied, try: "
+                        f"sudo python -m jjp_decryptor") from e
 
-            # Start Docker container with the image accessible
-            # (cache dir is bind-mounted as /tmp in the container)
+                # Detect game name via debugfs
+                try:
+                    result = self._debugfs_run(
+                        f"ls {config.GAME_BASE_PATH}", timeout=15)
+                    for name in re.findall(r'\(\d+\)\s+(\S+)', result):
+                        if name in ('.', '..'):
+                            continue
+                        try:
+                            stat_out = self._debugfs_run(
+                                f'stat "{config.GAME_BASE_PATH}/{name}/game"',
+                                timeout=10)
+                            if ('Inode:' in stat_out
+                                    or 'Type: regular' in stat_out):
+                                self.game_name = name
+                                display = config.KNOWN_GAMES.get(name, name)
+                                self.log(
+                                    f"Detected game: {display} ({name})",
+                                    "success")
+                                break
+                        except CommandError:
+                            pass
+                except CommandError:
+                    pass
+
+                if not read_only:
+                    # Mod mode: set up local temp dir for staging
+                    tag = uuid.uuid4().hex[:8]
+                    self._debugfs_tmp = tempfile.mkdtemp(
+                        prefix=f"jjp_debugfs_{tag}_")
+
+                self.mount_point = None
+                self._ssd_mounted = True  # signal for cleanup
+                self.log("Direct SSD access ready (native debugfs).",
+                         "success")
+                return  # skip mount_point validation below
+
+            # ── Docker fallback (no native debugfs) ──
+            # Stream the partition into the Docker VM's filesystem.
+            self.log("Native debugfs not found, falling back to Docker...",
+                     "info")
+            self.log(f"Preparing {device} for Docker access...", "info")
+
             host_paths = []
             if hasattr(self, 'output_path'):
                 host_paths.append(self.output_path)
@@ -4880,16 +5323,101 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                 host_paths.append(self.assets_folder)
             self.log("Starting Docker container...", "info")
             self.executor.start_container(host_paths)
-            wsl_img = self.executor.to_exec_path(self._ssd_image_path)
+
+            # Image path inside the container (Docker VM filesystem)
+            container_img = "/var/tmp/ssd_partition.img"
+            self._ssd_image_on_host = False
+
+            # Clean up stale images
+            try:
+                self.executor.run(
+                    f"rm -f '{container_img}'", timeout=10)
+            except CommandError:
+                pass
+            cache_dir = self.executor._cache_dir()
+            stale_host_img = os.path.join(cache_dir, "ssd_partition.img")
+            if os.path.exists(stale_host_img):
+                try:
+                    os.unlink(stale_host_img)
+                except OSError:
+                    pass
+
+            self.log("Copying SSD partition to Docker VM (this may take "
+                     "several minutes)...", "info")
+
+            # Stream: dd on host -> pipe -> docker exec cat > file
+            try:
+                dd_proc = subprocess.Popen(
+                    ["dd", f"if={raw_dev}", "bs=1048576"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                docker_proc = subprocess.Popen(
+                    ["docker", "exec", "-i", "jjp-decryptor-worker",
+                     "sh", "-c", f"cat > '{container_img}'"],
+                    stdin=dd_proc.stdout,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                dd_proc.stdout.close()
+
+                docker_out, docker_err = docker_proc.communicate(timeout=3600)
+                dd_proc.wait(timeout=30)
+                dd_stderr = dd_proc.stderr.read().decode(errors="replace")
+                dd_proc.stderr.close()
+
+                if dd_proc.returncode != 0:
+                    err_text = dd_stderr
+                    if "Permission denied" in err_text:
+                        raise PipelineError("Mount",
+                            f"Failed to read SSD partition via dd:\n"
+                            f"{err_text}\n\n"
+                            f"If permission denied, try: "
+                            f"sudo python -m jjp_decryptor")
+                    raise PipelineError("Mount",
+                        f"Failed to read SSD partition via dd:\n{err_text}")
+                if docker_proc.returncode != 0:
+                    raise PipelineError("Mount",
+                        "Failed to stream partition image into Docker:\n"
+                        + docker_err.decode(errors="replace"))
+            except PipelineError:
+                raise
+            except subprocess.TimeoutExpired:
+                dd_proc.kill()
+                docker_proc.kill()
+                raise PipelineError("Mount",
+                    "Timed out copying SSD partition to Docker VM.")
+            except Exception as e:
+                raise PipelineError("Mount",
+                    f"Failed to copy SSD partition: {e}") from e
+
+            # Verify the image arrived
+            try:
+                size_out = self.executor.run(
+                    f"stat -c%s '{container_img}'", timeout=10).strip()
+                img_size = int(size_out)
+                self.log(f"Partition image: {img_size / (1024**3):.1f} GB",
+                         "success")
+            except (CommandError, ValueError):
+                raise PipelineError("Mount",
+                    "Partition image not found inside Docker container.")
+
+            wsl_img = container_img
+            self._ssd_image_path = None
 
             if read_only:
                 # Decrypt mode: loop mount the image read-only
                 try:
                     self.executor.run(
                         f"mkdir -p {self.mount_point}", timeout=10)
-                    self.executor.run(
-                        f"mount -o loop,ro '{wsl_img}' {self.mount_point}",
-                        timeout=config.MOUNT_TIMEOUT)
+                    try:
+                        self.executor.run(
+                            f"mount -o loop,ro '{wsl_img}' "
+                            f"{self.mount_point}",
+                            timeout=config.MOUNT_TIMEOUT)
+                    except CommandError:
+                        self.log("Journal is dirty, mounting with "
+                                 "noload...", "info")
+                        self.executor.run(
+                            f"mount -o loop,ro,noload '{wsl_img}' "
+                            f"{self.mount_point}",
+                            timeout=config.MOUNT_TIMEOUT)
                     self._ssd_mounted = True
                     self.log(f"Image mounted at {self.mount_point}", "success")
                 except CommandError as e:
@@ -4916,8 +5444,7 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                 try:
                     result = self._debugfs_run(
                         f"ls {config.GAME_BASE_PATH}", timeout=15)
-                    import re as _re2
-                    for name in _re2.findall(r'\(\d+\)\s+(\S+)', result):
+                    for name in re.findall(r'\(\d+\)\s+(\S+)', result):
                         if name in ('.', '..'):
                             continue
                         try:
@@ -4937,9 +5464,9 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                     pass
 
                 self.mount_point = None
-                self._ssd_mounted = True  # signal for cleanup
+                self._ssd_mounted = True
                 self.log("Image prepared for debugfs operations.", "success")
-                return  # skip validation below (no mount_point)
+                return
 
         elif isinstance(self.executor, NativeExecutor):
             # Linux: direct mount
@@ -5009,27 +5536,41 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                             timeout=15)
                     self._disk_was_offlined = False
             elif isinstance(self.executor, DockerExecutor):
-                # macOS Docker: unmount loop mount or clean debugfs tmp
-                if self.mount_point:
-                    try:
-                        self.executor.run(
-                            f"umount '{self.mount_point}' 2>/dev/null; true",
-                            timeout=30)
-                    except CommandError:
-                        pass
-                    try:
-                        self.executor.run(
-                            f"rmdir '{self.mount_point}' 2>/dev/null; true",
-                            timeout=5)
-                    except CommandError:
-                        pass
-                if hasattr(self, '_debugfs_tmp'):
-                    try:
-                        self.executor.run(
-                            f"rm -rf '{self._debugfs_tmp}' 2>/dev/null; true",
-                            timeout=10)
-                    except CommandError:
-                        pass
+                if getattr(self, '_native_debugfs_path', None):
+                    # Native debugfs mode: clean up local temp dir only
+                    if hasattr(self, '_debugfs_tmp') and \
+                            os.path.isdir(self._debugfs_tmp):
+                        import shutil as _shutil
+                        try:
+                            _shutil.rmtree(self._debugfs_tmp,
+                                           ignore_errors=True)
+                        except Exception:
+                            pass
+                else:
+                    # Docker mode: unmount loop mount or clean debugfs tmp
+                    if self.mount_point:
+                        try:
+                            self.executor.run(
+                                f"umount '{self.mount_point}' "
+                                f"2>/dev/null; true",
+                                timeout=30)
+                        except CommandError:
+                            pass
+                        try:
+                            self.executor.run(
+                                f"rmdir '{self.mount_point}' "
+                                f"2>/dev/null; true",
+                                timeout=5)
+                        except CommandError:
+                            pass
+                    if hasattr(self, '_debugfs_tmp'):
+                        try:
+                            self.executor.run(
+                                f"rm -rf '{self._debugfs_tmp}' "
+                                f"2>/dev/null; true",
+                                timeout=10)
+                        except CommandError:
+                            pass
             else:
                 # Linux: unmount inside executor
                 try:
@@ -5048,16 +5589,64 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
             self._ssd_mounted = False
 
         # Write modified image back to SSD (macOS Docker modify mode)
-        if (getattr(self, '_needs_writeback', False)
-                and getattr(self, '_succeeded', False)
-                and self._ssd_image_path
+        _img_in_container = not getattr(self, '_ssd_image_on_host', True)
+        _needs_wb = (getattr(self, '_needs_writeback', False)
+                     and getattr(self, '_succeeded', False))
+
+        if _needs_wb and _img_in_container:
+            # Image lives inside Docker VM — stream it back to SSD
+            device = self.device_path
+            part_num = getattr(self, '_part_num', config.GAME_PARTITION_NUMBER)
+            raw_dev = device.replace("/dev/disk", "/dev/rdisk") + f"s{part_num}"
+            container_img = "/var/tmp/ssd_partition.img"
+            self.log("Writing modified image back to SSD (this may take "
+                     "several minutes)...", "info")
+            self.executor.run_host(
+                f"diskutil unmountDisk {device}", timeout=15)
+            import subprocess as _sp
+            try:
+                docker_proc = _sp.Popen(
+                    ["docker", "exec", "jjp-decryptor-worker",
+                     "cat", container_img],
+                    stdout=_sp.PIPE, stderr=_sp.PIPE)
+                dd_proc = _sp.Popen(
+                    ["dd", f"of={raw_dev}", "bs=1048576"],
+                    stdin=docker_proc.stdout, stdout=_sp.PIPE, stderr=_sp.PIPE)
+                docker_proc.stdout.close()
+
+                dd_out, dd_err = dd_proc.communicate(timeout=3600)
+                docker_proc.wait(timeout=30)
+
+                if dd_proc.returncode != 0 or docker_proc.returncode != 0:
+                    err = dd_err.decode(errors="replace")
+                    self.log(f"WARNING: Failed to write image back to SSD!\n"
+                             f"{err}\n\n"
+                             f"The modified image is preserved inside the "
+                             f"Docker container at {container_img}.\n"
+                             f"Do NOT stop Docker until you have recovered it.",
+                             "error")
+                else:
+                    self.executor.run_host("sync", timeout=30)
+                    self.log("Image written back to SSD successfully.",
+                             "success")
+                    self._writeback_ok = True
+            except _sp.TimeoutExpired:
+                self.log("WARNING: Timed out writing image back to SSD!\n"
+                         f"The modified image is preserved inside the "
+                         f"Docker container at {container_img}.",
+                         "error")
+            except Exception as e:
+                self.log(f"WARNING: Failed to write image back to SSD: {e}",
+                         "error")
+
+        elif (_needs_wb and self._ssd_image_path
                 and os.path.isfile(self._ssd_image_path)):
+            # Image lives on host filesystem (legacy path)
             device = self.device_path
             part_num = getattr(self, '_part_num', config.GAME_PARTITION_NUMBER)
             raw_dev = device.replace("/dev/disk", "/dev/rdisk") + f"s{part_num}"
             self.log("Writing modified image back to SSD (this may take "
                      "several minutes)...", "info")
-            # Unmount disk before writing
             self.executor.run_host(
                 f"diskutil unmountDisk {device}", timeout=15)
             rc, stdout, stderr = self.executor.run_host(
@@ -5088,9 +5677,18 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                 os.unlink(self._ssd_image_path)
             except OSError:
                 pass
+        # Clean up container-internal image (unless writeback failed)
+        if _img_in_container and not writeback_failed:
+            try:
+                self.executor.run(
+                    "rm -f /var/tmp/ssd_partition.img 2>/dev/null; true",
+                    timeout=15)
+            except (CommandError, Exception):
+                pass
 
-        # Stop Docker container if applicable
-        if isinstance(self.executor, DockerExecutor):
+        # Stop Docker container if applicable (not used in native mode)
+        if isinstance(self.executor, DockerExecutor) \
+                and not getattr(self, '_native_debugfs_path', None):
             try:
                 self.executor.stop_container()
             except Exception:
@@ -5151,9 +5749,12 @@ class DirectSSDModPipeline(StandaloneModPipeline):
 
             self.on_phase(2)  # Encrypt
             if isinstance(self.executor, DockerExecutor):
-                # macOS: use debugfs to write to raw image (no mount)
+                # macOS: use debugfs to write to raw image / raw device
                 self._phase_encrypt_standalone()
-                self._needs_writeback = True
+                # Native debugfs writes directly to SSD — no writeback.
+                # Docker mode writes to a copied image — needs writeback.
+                if not getattr(self, '_native_debugfs_path', None):
+                    self._needs_writeback = True
             else:
                 self._phase_encrypt_ssd()
             self._check_cancel()
@@ -5713,6 +6314,16 @@ def check_prerequisites(executor, standalone=False):
                     executor.stop_container()
                 except Exception:
                     pass
+
+        # Native debugfs (Homebrew e2fsprogs) — enables direct SSD access
+        native_debugfs = _find_native_debugfs()
+        if native_debugfs:
+            results.append(("debugfs", True,
+                f"Available (native: {native_debugfs})"))
+        else:
+            results.append(("debugfs", False,
+                "Not installed. Run: brew install e2fsprogs\n"
+                "  (enables direct SSD access without copying)"))
 
     elif isinstance(executor, NativeExecutor):
         # Linux: check tools directly
