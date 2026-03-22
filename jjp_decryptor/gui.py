@@ -722,6 +722,9 @@ class MainWindow:
                         ).pack(side=tk.LEFT, padx=(0, 16))
         ttk.Radiobutton(radio_row, text="Write to SSD",
                         variable=self._write_method_var, value="ssd"
+                        ).pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Radiobutton(radio_row, text="Restore ISO to SSD",
+                        variable=self._write_method_var, value="restore"
                         ).pack(side=tk.LEFT)
 
         # --- Per-tab config fields ---
@@ -851,6 +854,33 @@ class MainWindow:
             foreground=c["gray"], wraplength=700, justify=tk.LEFT)
         self._write_ssd_desc.pack(anchor=tk.W, pady=(0, 6))
 
+        # Restore sub-section
+        self._write_restore_frame = ttk.Frame(self._write_content_area)
+
+        self._write_restore_warning = ttk.Label(
+            self._write_restore_frame,
+            text=("\u26A0  This will ERASE the target SSD and replace it "
+                  "with the contents of the ISO. All existing data on the "
+                  "SSD will be lost."),
+            foreground=c["error"], wraplength=700, justify=tk.LEFT)
+        self._write_restore_warning.pack(anchor=tk.W, pady=(0, 6))
+
+        if not _is_admin() and sys.platform == "win32":
+            ttk.Label(
+                self._write_restore_frame,
+                text="\u26A0  Restore requires Run as Administrator "
+                     "(right-click the app \u2192 Run as administrator).",
+                foreground=c["error"], wraplength=700,
+                justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 6))
+
+        self._write_restore_desc = ttk.Label(
+            self._write_restore_frame,
+            text="Write a Clonezilla game ISO directly to a blank SSD. "
+                 "No USB boot or Clonezilla restore step needed — the SSD "
+                 "will be ready to use in the pinball machine.",
+            foreground=c["gray"], wraplength=700, justify=tk.LEFT)
+        self._write_restore_desc.pack(anchor=tk.W, pady=(0, 6))
+
         # Show ISO frame initially
         self._write_iso_frame.pack(fill=tk.X, in_=self._write_content_area)
 
@@ -929,6 +959,7 @@ class MainWindow:
         # Hide all conditional frames
         self._write_iso_frame.pack_forget()
         self._write_ssd_frame.pack_forget()
+        self._write_restore_frame.pack_forget()
 
         # Show/hide config rows based on mode
         self._write_input_row.pack_forget()
@@ -947,7 +978,7 @@ class MainWindow:
                 in_=self._write_content_area)
             phases = config.STANDALONE_MOD_PHASES
             self.write_apply_btn.configure(text="Apply Modifications")
-        else:  # ssd
+        elif method == "ssd":
             self._write_input_row.pack(fill=tk.X, pady=2,
                 in_=self._write_cfg_frame)
             self._write_ssd_row.pack(fill=tk.X, pady=2,
@@ -957,6 +988,18 @@ class MainWindow:
             phases = config.DIRECT_SSD_MOD_PHASES
             self.write_apply_btn.configure(text="Apply Modifications")
             # Auto-refresh device list when switching to SSD mode
+            if not getattr(self, '_write_ssd_devices', None):
+                self._ssd_refresh_write_devices()
+        else:  # restore
+            self._write_orig_image_row.pack(fill=tk.X, pady=2,
+                in_=self._write_cfg_frame)
+            self._write_ssd_row.pack(fill=tk.X, pady=2,
+                in_=self._write_cfg_frame)
+            self._write_restore_frame.pack(fill=tk.X,
+                in_=self._write_content_area)
+            phases = config.RESTORE_TO_SSD_PHASES
+            self.write_apply_btn.configure(text="Restore to SSD")
+            # Auto-refresh device list
             if not getattr(self, '_write_ssd_devices', None):
                 self._ssd_refresh_write_devices()
 
@@ -1044,7 +1087,7 @@ class MainWindow:
         return self._decrypt_source_var.get()
 
     def get_write_method(self):
-        """Return 'iso' or 'ssd' based on the Write tab radio."""
+        """Return 'iso', 'ssd', or 'restore' based on the Write tab radio."""
         return self._write_method_var.get()
 
     # ------------------------------------------------------------------
@@ -1480,6 +1523,7 @@ class MainWindow:
             "modify_standalone": config.STANDALONE_MOD_PHASES,
             "ssd_decrypt": config.DIRECT_SSD_PHASES,
             "ssd_modify": config.DIRECT_SSD_MOD_PHASES,
+            "restore_ssd": config.RESTORE_TO_SSD_PHASES,
         }
         phases = phase_map.get(mode, config.PHASES)
 

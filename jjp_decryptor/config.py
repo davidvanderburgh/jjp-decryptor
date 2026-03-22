@@ -126,6 +126,13 @@ DIRECT_SSD_MOD_PHASES = [
     "Cleanup",
 ]
 
+RESTORE_TO_SSD_PHASES = [
+    "Extract",
+    "Partition",
+    "Restore",
+    "Cleanup",
+]
+
 # Partition number containing game data (1-indexed for wsl --mount)
 GAME_PARTITION_NUMBER = 3
 

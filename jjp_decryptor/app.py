@@ -601,6 +601,9 @@ class App:
         if method == "ssd":
             self._start_ssd_modify()
             return
+        if method == "restore":
+            self._start_restore_to_ssd()
+            return
 
         # ISO modify — uses Write tab fields
         output_path = self.window.write_input_var.get().strip()
@@ -757,6 +760,68 @@ class App:
         self.pipeline.log_link = lambda text, url: self.msg_queue.put(LinkMsg(text, url))
         self.pipeline._file_tree_cb = lambda rel_path, status: \
             self.msg_queue.put(FileTreeMsg(rel_path, status))
+        threading.Thread(target=self.pipeline.run, daemon=True).start()
+
+    def _start_restore_to_ssd(self):
+        """Start the ISO-to-SSD restore pipeline."""
+        from .pipeline import RestoreToSSDPipeline
+
+        device = self.window.get_write_ssd_device()
+        image_path = self.window.write_orig_image_var.get().strip()
+
+        if device is None:
+            messagebox.showwarning("No Device",
+                "Please select a drive from the device list.\n\n"
+                "Connect the target SSD via a USB enclosure, then "
+                "click Refresh.")
+            return
+        if not image_path:
+            messagebox.showwarning("Missing Input",
+                "Please select the game ISO file to restore.")
+            return
+        if not image_path.lower().endswith(".iso"):
+            messagebox.showwarning("Not an ISO",
+                "Please select a Clonezilla ISO file (.iso).")
+            return
+
+        # Double-confirm — this is destructive
+        proceed = messagebox.askyesno(
+            "Confirm Restore to SSD",
+            f"WARNING: This will ERASE ALL DATA on:\n\n"
+            f"  Model:   {device.model}\n"
+            f"  Size:      {device.size_display}\n"
+            f"  Bus:       {device.bus_type}\n"
+            f"  Device:  {device.device_id}\n\n"
+            f"The SSD will be overwritten with the contents of:\n"
+            f"  {os.path.basename(image_path)}\n\n"
+            f"This CANNOT be undone. Continue?")
+        if not proceed:
+            return
+
+        self._save_settings()
+
+        self._active_mode = "restore_ssd"
+        self.window.set_running(True, mode=self._active_mode)
+        self.window.reset_steps(mode=self._active_mode)
+
+        def log_cb(text, level="info"):
+            self.msg_queue.put(LogMsg(text, level))
+
+        def phase_cb(index):
+            self.msg_queue.put(PhaseMsg(index))
+
+        def progress_cb(current, total, desc=""):
+            self.msg_queue.put(ProgressMsg(current, total, desc))
+
+        def done_cb(success, summary):
+            self.msg_queue.put(DoneMsg(success, summary))
+
+        log_cb(f"Restoring {os.path.basename(image_path)} to SSD...", "info")
+
+        self.pipeline = RestoreToSSDPipeline(
+            image_path, device.device_id,
+            log_cb, phase_cb, progress_cb, done_cb,
+        )
         threading.Thread(target=self.pipeline.run, daemon=True).start()
 
     def _start_export(self):
