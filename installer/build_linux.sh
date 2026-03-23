@@ -22,14 +22,14 @@ pip3 install --quiet pyinstaller 2>/dev/null || true
 pyinstaller \
     --name "jjp-decryptor" \
     --onedir \
-    --add-data "jjp_decryptor/icon.png:jjp_decryptor" \
-    --add-data "partclone_to_raw.py:." \
+    --add-data "$ROOT_DIR/jjp_decryptor/icon.png:jjp_decryptor" \
+    --add-data "$ROOT_DIR/partclone_to_raw.py:." \
     --noconfirm \
     --clean \
     --distpath "$SCRIPT_DIR/build/dist" \
     --workpath "$SCRIPT_DIR/build/work" \
     --specpath "$SCRIPT_DIR/build" \
-    jjp_decryptor/__main__.py
+    "$ROOT_DIR/jjp_decryptor/__main__.py"
 
 DIST_DIR="$SCRIPT_DIR/build/dist/jjp-decryptor"
 
