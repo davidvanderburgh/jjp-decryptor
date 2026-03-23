@@ -73,6 +73,39 @@ jobs:
           name: windows-installer
           path: installer/Output/*.exe
 
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller pillow
+          # Install appimagetool
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
+            -O /usr/local/bin/appimagetool
+          chmod +x /usr/local/bin/appimagetool
+
+      - name: Generate icon if missing
+        run: |
+          if [ ! -f jjp_decryptor/icon.png ]; then
+            python generate_icon.py
+          fi
+
+      - name: Build AppImage
+        run: bash installer/build_linux.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: installer/Output/*.AppImage
+
   build-docker:
     runs-on: ubuntu-latest
     steps:
@@ -106,7 +139,7 @@ jobs:
             ghcr.io/${{ github.repository }}:${{ steps.version.outputs.tag }}
 
   release:
-    needs: [build-macos, build-windows, build-docker]
+    needs: [build-macos, build-windows, build-linux, build-docker]
     runs-on: ubuntu-latest
     steps:
       - name: Download macOS artifact
@@ -121,9 +154,16 @@ jobs:
           name: windows-installer
           path: artifacts/windows-installer
 
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-appimage
+          path: artifacts/linux-appimage
+
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/macos-dmg/*.dmg
             artifacts/windows-installer/*.exe
+            artifacts/linux-appimage/*.AppImage
