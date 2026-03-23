@@ -160,10 +160,30 @@ jobs:
           name: linux-appimage
           path: artifacts/linux-appimage
 
+      - name: Rename artifacts with platform labels
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          # Windows
+          for f in artifacts/windows-installer/*.exe; do
+            mv "$f" "artifacts/windows-installer/JJP_Asset_Decryptor_${VERSION}_Windows.exe"
+          done
+          # macOS
+          for f in artifacts/macos-dmg/*.dmg; do
+            mv "$f" "artifacts/macos-dmg/JJP_Asset_Decryptor_${VERSION}_Mac.dmg"
+          done
+          # Linux — tar to preserve execute permission
+          for f in artifacts/linux-appimage/*.AppImage; do
+            APPIMAGE_NAME=$(basename "$f")
+            TAR_NAME="JJP_Asset_Decryptor_${VERSION}_Linux.tar.gz"
+            chmod +x "$f"
+            tar -czf "artifacts/linux-appimage/${TAR_NAME}" -C artifacts/linux-appimage "$APPIMAGE_NAME"
+            rm "$f"
+          done
+
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/macos-dmg/*.dmg
             artifacts/windows-installer/*.exe
-            artifacts/linux-appimage/*.AppImage
+            artifacts/linux-appimage/*.tar.gz
