@@ -4704,6 +4704,11 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
         out_dir = self.output_path
         os.makedirs(out_dir, exist_ok=True)
         game_name = self.game_name or ""
+        if not game_name:
+            raise PipelineError("Decrypt",
+                "Could not detect game name on the SSD. "
+                "The partition may not contain a JJP game, or the "
+                "filesystem layout is unexpected.")
         edata_dir = f"{config.GAME_BASE_PATH}/{game_name}/edata"
 
         has_fl_dat = self.fl_dat_path and os.path.isfile(self.fl_dat_path)
@@ -4875,6 +4880,43 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                 pass
 
         return entries
+
+    def _detect_game_via_debugfs(self):
+        """Detect game name by listing /jjpe/gen1 via debugfs ls -p.
+
+        Uses the pipe-delimited format (ls -p) which is consistent across
+        debugfs versions, rather than the human-readable format whose layout
+        varies between platforms (Linux vs macOS Homebrew e2fsprogs).
+        """
+        try:
+            output = self._debugfs_run(
+                f"ls -p {config.GAME_BASE_PATH}", timeout=15)
+        except CommandError:
+            return None
+
+        for line in output.splitlines():
+            parts = line.strip().split('/')
+            if len(parts) < 4:
+                continue
+            name = parts[3] if len(parts) > 3 else ""
+            if not name or name in ('.', '..'):
+                continue
+            entry_type = parts[2] if len(parts) > 2 else ""
+            if not entry_type.startswith('4'):
+                continue  # not a directory
+            # Check for game binary
+            try:
+                stat_out = self._debugfs_run(
+                    f'stat "{config.GAME_BASE_PATH}/{name}/game"',
+                    timeout=10)
+                if 'Inode:' in stat_out or 'Type: regular' in stat_out:
+                    display = config.KNOWN_GAMES.get(name, name)
+                    self.log(f"Detected game: {display} ({name})",
+                             "success")
+                    return name
+            except CommandError:
+                pass
+        return None
 
     def _debugfs_ls_recursive(self, path, result_list):
         """Recursively list files under a directory via debugfs."""
@@ -5278,28 +5320,7 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                         f"sudo python -m jjp_decryptor") from e
 
                 # Detect game name via debugfs
-                try:
-                    result = self._debugfs_run(
-                        f"ls {config.GAME_BASE_PATH}", timeout=15)
-                    for name in re.findall(r'\(\d+\)\s+(\S+)', result):
-                        if name in ('.', '..'):
-                            continue
-                        try:
-                            stat_out = self._debugfs_run(
-                                f'stat "{config.GAME_BASE_PATH}/{name}/game"',
-                                timeout=10)
-                            if ('Inode:' in stat_out
-                                    or 'Type: regular' in stat_out):
-                                self.game_name = name
-                                display = config.KNOWN_GAMES.get(name, name)
-                                self.log(
-                                    f"Detected game: {display} ({name})",
-                                    "success")
-                                break
-                        except CommandError:
-                            pass
-                except CommandError:
-                    pass
+                self.game_name = self._detect_game_via_debugfs()
 
                 if not read_only:
                     # Mod mode: set up local temp dir for staging
@@ -5444,27 +5465,7 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                         f"{e.output}") from e
 
                 # Detect game name via debugfs
-                try:
-                    result = self._debugfs_run(
-                        f"ls {config.GAME_BASE_PATH}", timeout=15)
-                    for name in re.findall(r'\(\d+\)\s+(\S+)', result):
-                        if name in ('.', '..'):
-                            continue
-                        try:
-                            stat_out = self._debugfs_run(
-                                f'stat "{config.GAME_BASE_PATH}/{name}/game"',
-                                timeout=10)
-                            if ('Inode:' in stat_out
-                                    or 'Type: regular' in stat_out):
-                                self.game_name = name
-                                display = config.KNOWN_GAMES.get(name, name)
-                                self.log(f"Detected game: {display} ({name})",
-                                         "success")
-                                break
-                        except CommandError:
-                            pass
-                except CommandError:
-                    pass
+                self.game_name = self._detect_game_via_debugfs()
 
                 self.mount_point = None
                 self._ssd_mounted = True
