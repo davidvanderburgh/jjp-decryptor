@@ -4882,29 +4882,52 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
         return entries
 
     def _detect_game_via_debugfs(self):
-        """Detect game name by listing /jjpe/gen1 via debugfs ls -p.
+        """Detect game name on the SSD via debugfs.
 
-        Uses the pipe-delimited format (ls -p) which is consistent across
-        debugfs versions, rather than the human-readable format whose layout
-        varies between platforms (Linux vs macOS Homebrew e2fsprogs).
+        Primary method: stat the game binary for each known game name.
+        Fallback: parse ``ls -p`` output for unknown game directories.
         """
+        # Fast path: check known game names directly via stat
+        for name in config.KNOWN_GAMES:
+            try:
+                stat_out = self._debugfs_run(
+                    f'stat "{config.GAME_BASE_PATH}/{name}/game"',
+                    timeout=10)
+                if 'Inode:' in stat_out or 'Type: regular' in stat_out:
+                    display = config.KNOWN_GAMES.get(name, name)
+                    self.log(f"Detected game: {display} ({name})",
+                             "success")
+                    return name
+            except CommandError:
+                pass
+
+        # Fallback: list directory entries for unknown games
         try:
             output = self._debugfs_run(
                 f"ls -p {config.GAME_BASE_PATH}", timeout=15)
         except CommandError:
             return None
 
+        # debugfs ls -p fields: /inode/mode/rec_len/name_len/name/
+        # Extract name from the second-to-last field (before trailing /)
         for line in output.splitlines():
-            parts = line.strip().split('/')
-            if len(parts) < 4:
+            line = line.strip()
+            if not line or not line.startswith('/'):
                 continue
-            name = parts[3] if len(parts) > 3 else ""
+            # Split and grab the name field (second-to-last, before
+            # the trailing empty element from the final /)
+            parts = line.split('/')
+            # Find name: last non-empty field
+            name = ''
+            for p in reversed(parts):
+                if p and p not in ('.', '..'):
+                    name = p
+                    break
             if not name or name in ('.', '..'):
                 continue
-            entry_type = parts[2] if len(parts) > 2 else ""
-            if not entry_type.startswith('4'):
-                continue  # not a directory
-            # Check for game binary
+            # Skip entries that look like numbers (rec_len, etc.)
+            if name.isdigit():
+                continue
             try:
                 stat_out = self._debugfs_run(
                     f'stat "{config.GAME_BASE_PATH}/{name}/game"',
@@ -4925,17 +4948,23 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
         except CommandError:
             return
         for line in output.splitlines():
-            # debugfs ls -p format: inode/type/name
-            # Pipe-separated: e.g. /123456/100644/filename/
-            parts = line.strip().split('/')
+            # debugfs ls -p format: /inode/mode/rec_len/name_len/name/
+            # e.g. /12345/040755/20/6/Avatar/
+            # Name is the second-to-last field (before trailing /)
+            line = line.strip()
+            if not line or not line.startswith('/'):
+                continue
+            parts = line.split('/')
+            # parts[-1] is '' (trailing /), parts[-2] is name
             if len(parts) < 4:
                 continue
-            name = parts[3] if len(parts) > 3 else ""
+            name = parts[-2] if parts[-1] == '' else parts[-1]
             if not name or name in ('.', '..'):
                 continue
-            entry_type = parts[2] if len(parts) > 2 else ""
+            # Mode field is parts[2]; directory = 04xxxx, file = 10xxxx
+            mode = parts[2] if len(parts) > 2 else ""
             full_path = f"{path}/{name}"
-            if entry_type.startswith('4'):
+            if mode.startswith('04'):
                 # Directory — recurse
                 self._debugfs_ls_recursive(full_path, result_list)
             else:
@@ -4998,16 +5027,19 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
         except CommandError:
             return
         for line in output.splitlines():
-            parts = line.strip().split('/')
+            line = line.strip()
+            if not line or not line.startswith('/'):
+                continue
+            parts = line.split('/')
             if len(parts) < 4:
                 continue
-            name = parts[3] if len(parts) > 3 else ""
+            name = parts[-2] if parts[-1] == '' else parts[-1]
             if not name or name in ('.', '..'):
                 continue
-            entry_type = parts[2] if len(parts) > 2 else ""
+            mode = parts[2] if len(parts) > 2 else ""
             full_path = f"{path}/{name}" if path != "/" else f"/{name}"
             rel = full_path.lstrip("/")
-            if entry_type.startswith('4'):
+            if mode.startswith('04'):
                 if rel not in exclude_dirs:
                     self._debugfs_ls_recursive_filtered(
                         full_path, result_list, exclude_dirs, prefix)
@@ -6156,6 +6188,8 @@ class DirectSSDModPipeline(StandaloneModPipeline):
     _detect_partition = DirectSSDDecryptPipeline._detect_partition
     _mount_ssd = DirectSSDDecryptPipeline._mount_ssd
     _cleanup_ssd = DirectSSDDecryptPipeline._cleanup_ssd
+    _debugfs_run = DirectSSDDecryptPipeline._debugfs_run
+    _detect_game_via_debugfs = DirectSSDDecryptPipeline._detect_game_via_debugfs
 
 
 class RestoreToSSDPipeline:
