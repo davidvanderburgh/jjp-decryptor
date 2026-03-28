@@ -5095,6 +5095,22 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                         self.log(f"Auto-detected largest Linux partition: "
                                  f"{device}s{best_part} "
                                  f"({best_size / 1e9:.1f} GB)", "info")
+                        # Detect A/B layout: two partitions within 5%
+                        # of each other's size (both large)
+                        self._ab_partitions = None
+                        if best_size > 1e9:  # >1 GB
+                            peers = [
+                                p for p, sz in linux_parts
+                                if p != best_part
+                                and sz > 0
+                                and abs(sz - best_size) / best_size < 0.05
+                            ]
+                            if peers:
+                                self._ab_partitions = [best_part] + peers
+                                self.log(
+                                    f"Detected A/B partition layout: "
+                                    f"{', '.join(f'{device}s{p}' for p in self._ab_partitions)}",
+                                    "info")
                         return best_part
 
                     # Fallback: find the largest non-EFI/non-boot partition
@@ -5759,6 +5775,35 @@ class DirectSSDModPipeline(StandaloneModPipeline):
                 # Docker mode writes to a copied image — needs writeback.
                 if not getattr(self, '_native_debugfs_path', None):
                     self._needs_writeback = True
+
+                # A/B partition layout: also write to the partner partition
+                ab = getattr(self, '_ab_partitions', None)
+                native = getattr(self, '_native_debugfs_path', None)
+                if ab and native and len(ab) > 1:
+                    primary_dev = self._wsl_img
+                    device = self.device_path
+                    for alt_part in ab[1:]:
+                        alt_dev = device.replace(
+                            "/dev/disk", "/dev/rdisk") + f"s{alt_part}"
+                        self.log(
+                            f"A/B layout: writing same changes to "
+                            f"partner partition {device}s{alt_part}...",
+                            "info")
+                        self._wsl_img = alt_dev
+                        try:
+                            # Validate the partner is also ext4
+                            self._debugfs_run("stats", timeout=30)
+                            self._phase_encrypt_standalone()
+                            self.log(
+                                f"A/B partner {device}s{alt_part} updated.",
+                                "success")
+                        except (CommandError, PipelineError) as e:
+                            self.log(
+                                f"Warning: could not update partner "
+                                f"partition {device}s{alt_part}: {e}",
+                                "info")
+                        finally:
+                            self._wsl_img = primary_dev
             else:
                 self._phase_encrypt_ssd()
             self._check_cancel()
