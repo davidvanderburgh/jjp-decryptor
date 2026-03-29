@@ -231,6 +231,7 @@ class DecryptionPipeline:
         self._succeeded = False
         self._bind_mounted = []
         self._iso_mount = None      # temp mount for ISO
+        self._iso_mounted = False   # True if ISO was loop-mounted (vs xorriso)
         self._raw_img_path = None   # extracted raw ext4 (cached between runs)
 
     def cancel(self):
@@ -509,21 +510,33 @@ class DecryptionPipeline:
         tag = uuid.uuid4().hex[:8]
         self._iso_mount = f"/var/tmp/jjp_iso_{tag}"
 
-        # Mount the ISO
+        # Mount the ISO (or extract via xorriso if loop devices fail)
+        self._iso_mounted = False
         try:
             self.executor.run(f"mkdir -p {self._iso_mount}", timeout=10)
             self.executor.run(
                 f"mount -o loop,ro '{wsl_iso}' {self._iso_mount}",
                 timeout=config.MOUNT_TIMEOUT,
             )
+            self._iso_mounted = True
         except CommandError as e:
-            msg = f"Failed to mount ISO: {e.output}"
-            if "loop device" in (e.output or "").lower():
-                msg += (
-                    "\n\nIf running in Docker, you must use --privileged:\n"
-                    "  docker run --privileged --rm -v ... ghcr.io/davidvanderburgh/jjp-decryptor ..."
+            # Loop devices often fail on Docker Desktop for Mac (VirtioFS
+            # doesn't support the ioctls loop needs on bind-mounted files).
+            # Fall back to xorriso extraction which doesn't need loop.
+            self.log("Loop mount failed, extracting ISO via xorriso...",
+                     "info")
+            try:
+                self.executor.run(
+                    f"xorriso -osirrox on -indev '{wsl_iso}' "
+                    f"-extract {config.PARTIMAG_PATH} "
+                    f"{self._iso_mount}{config.PARTIMAG_PATH}",
+                    timeout=600,
                 )
-            raise PipelineError("Extract", msg) from e
+            except CommandError as e2:
+                raise PipelineError("Extract",
+                    f"Failed to mount ISO (loop device unavailable) "
+                    f"and xorriso extraction also failed:\n{e2.output}"
+                ) from e2
 
         self.log("ISO mounted. Looking for game partition image...", "info")
 
@@ -1549,11 +1562,12 @@ class DecryptionPipeline:
             except CommandError:
                 pass
 
-        # Clean up ISO mount if we used one
+        # Clean up ISO mount / extraction directory
         if self._iso_mount:
             try:
-                self.executor.run(f"umount -l '{self._iso_mount}' 2>/dev/null; true", timeout=15)
-                self.executor.run(f"rmdir '{self._iso_mount}' 2>/dev/null; true", timeout=5)
+                if getattr(self, '_iso_mounted', False):
+                    self.executor.run(f"umount -l '{self._iso_mount}' 2>/dev/null; true", timeout=15)
+                self.executor.run(f"rm -rf '{self._iso_mount}' 2>/dev/null; true", timeout=15)
             except CommandError:
                 pass
 
@@ -2452,14 +2466,15 @@ class ModPipeline(DecryptionPipeline):
             timeout=10,
         )
 
-        # Unmount the original ISO before xorriso reads it — avoids
+        # Unmount/remove the original ISO before xorriso reads it — avoids
         # contention between the loop mount and xorriso's file access.
         if self._iso_mount:
             try:
+                if getattr(self, '_iso_mounted', False):
+                    self.executor.run(
+                        f"umount -l '{self._iso_mount}' 2>/dev/null; true", timeout=15)
                 self.executor.run(
-                    f"umount -l '{self._iso_mount}' 2>/dev/null; true", timeout=15)
-                self.executor.run(
-                    f"rmdir '{self._iso_mount}' 2>/dev/null; true", timeout=5)
+                    f"rm -rf '{self._iso_mount}' 2>/dev/null; true", timeout=15)
             except CommandError:
                 pass
             self._iso_mount = None
@@ -4895,12 +4910,15 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                     stat_out = self._debugfs_run(
                         f'stat "{config.GAME_BASE_PATH}/{name}/{target}"',
                         timeout=10)
+                    self.log(f"debugfs stat {name}/{target}: "
+                             f"{stat_out[:200]}", "info")
                     # debugfs returns exit 0 even on failure; check for
                     # success markers and absence of error messages
                     if 'not found' in stat_out.lower():
                         continue
                     if ('Inode:' in stat_out or 'Type:' in stat_out
-                            or 'Size:' in stat_out):
+                            or 'Size:' in stat_out
+                            or 'Links:' in stat_out):
                         display = config.KNOWN_GAMES.get(name, name)
                         self.log(f"Detected game: {display} ({name})",
                                  "success")
