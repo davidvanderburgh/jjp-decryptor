@@ -3286,10 +3286,10 @@ class StandaloneModPipeline(ModPipeline):
         native = getattr(self, '_native_debugfs_path', None)
         if native:
             # Native mode: run debugfs on host directly against raw device
-            args = []
             if getattr(self, '_use_sudo', False):
-                args.append("sudo")
-            args.append(native)
+                return self._debugfs_run_elevated(
+                    command, writable=writable, timeout=timeout)
+            args = [native]
             if writable:
                 args.append("-w")
             args.extend(["-R", command, self._wsl_img])
@@ -3317,6 +3317,40 @@ class StandaloneModPipeline(ModPipeline):
             f"debugfs {w}-R '{escaped}' '{self._wsl_img}' 2>&1",
             timeout=timeout,
         )
+
+    def _debugfs_run_elevated(self, command, writable=False, timeout=120):
+        """Run a debugfs command with macOS admin privileges via osascript.
+
+        Uses ``do shell script ... with administrator privileges`` which
+        invokes macOS Authorization Services.  The OS caches the grant
+        for ~5 minutes, so only the first call triggers a password dialog.
+        """
+        native = self._native_debugfs_path
+        w = "-w " if writable else ""
+        # Escape single quotes in the debugfs sub-command
+        escaped_cmd = command.replace("'", "'\\''")
+        # Build shell command; single-quote all path arguments
+        shell_cmd = (
+            f"'{native}' {w}-R '{escaped_cmd}' '{self._wsl_img}' 2>&1"
+        )
+        # Escape for AppleScript double-quoted string
+        as_cmd = shell_cmd.replace('\\', '\\\\').replace('"', '\\"')
+        try:
+            result = subprocess.run(
+                ["osascript", "-e",
+                 f'do shell script "{as_cmd}" '
+                 f'with administrator privileges'],
+                capture_output=True, text=True,
+                encoding='utf-8', errors='replace', timeout=timeout)
+        except subprocess.TimeoutExpired as e:
+            raise CommandError(
+                f"debugfs -R '{command}'", -1,
+                f"Timed out after {timeout}s") from e
+        output = (result.stdout or "") + (result.stderr or "")
+        if result.returncode != 0:
+            raise CommandError(
+                f"debugfs -R '{command}'", result.returncode, output)
+        return output
 
     def _debugfs_dump_file(self, image_file_path, timeout=120):
         """Extract a file from the ext4 image via debugfs dump.
@@ -5388,33 +5422,22 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
 
                 if ('permission denied' in stats_out.lower()
                         or 'filesystem not open' in stats_out.lower()):
-                    # Raw disk access needs root on macOS.  Use
-                    # osascript to prompt the user for their password
-                    # (standard macOS admin dialog), then cache sudo.
-                    self.log("Permission denied — requesting admin "
-                             "privileges...", "info")
+                    # Raw disk access needs root on macOS.  Enable
+                    # elevated mode — _debugfs_run_elevated uses
+                    # osascript "with administrator privileges" which
+                    # shows the standard macOS password dialog and
+                    # caches the auth for ~5 minutes.
+                    self.log("Permission denied — will request admin "
+                             "privileges via macOS dialog...", "info")
+                    self._use_sudo = True
                     try:
-                        rc, _, stderr = self.executor.run_host(
-                            'osascript -e \'do shell script '
-                            '"sudo -v" with administrator privileges\'',
-                            timeout=120)
-                        if rc != 0:
-                            raise PipelineError("Mount",
-                                "Admin privileges are required for "
-                                "raw disk access.\n"
-                                "Please approve the password prompt "
-                                "and try again.")
-                        self._use_sudo = True
-                        self.log("Admin privileges granted.", "success")
-                        # Retry validation with sudo
                         stats_out = self._debugfs_run(
                             "stats", timeout=30)
-                    except PipelineError:
-                        raise
-                    except Exception as e:
+                        self.log("Admin privileges granted.", "success")
+                    except CommandError as e:
                         raise PipelineError("Mount",
-                            f"Could not obtain admin privileges: {e}"
-                        ) from e
+                            f"Could not access disk with admin "
+                            f"privileges:\n{e.output}") from e
 
                 if 'Filesystem features' not in stats_out:
                     raise PipelineError("Mount",
@@ -5669,14 +5692,24 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                                 f"Running e2fsck on {device}s{p} to "
                                 f"commit journal...", "info")
                             try:
-                                e2fsck_cmd = [e2fsck, "-fy", raw]
                                 if getattr(self, '_use_sudo', False):
-                                    e2fsck_cmd = ["sudo"] + e2fsck_cmd
-                                result = subprocess.run(
-                                    e2fsck_cmd,
-                                    capture_output=True, text=True,
-                                    encoding='utf-8', errors='replace',
-                                    timeout=300)
+                                    # Use osascript for elevation
+                                    shell_cmd = f"'{e2fsck}' -fy '{raw}' 2>&1"
+                                    as_cmd = shell_cmd.replace(
+                                        '\\', '\\\\').replace('"', '\\"')
+                                    result = subprocess.run(
+                                        ["osascript", "-e",
+                                         f'do shell script "{as_cmd}" '
+                                         f'with administrator privileges'],
+                                        capture_output=True, text=True,
+                                        encoding='utf-8', errors='replace',
+                                        timeout=300)
+                                else:
+                                    result = subprocess.run(
+                                        [e2fsck, "-fy", raw],
+                                        capture_output=True, text=True,
+                                        encoding='utf-8', errors='replace',
+                                        timeout=300)
                                 # e2fsck returns 1 if it fixed errors,
                                 # 0 if clean — both are OK
                                 if result.returncode <= 1:
@@ -6318,6 +6351,7 @@ class DirectSSDModPipeline(StandaloneModPipeline):
     _mount_ssd = DirectSSDDecryptPipeline._mount_ssd
     _cleanup_ssd = DirectSSDDecryptPipeline._cleanup_ssd
     _debugfs_run = DirectSSDDecryptPipeline._debugfs_run
+    _debugfs_run_elevated = DirectSSDDecryptPipeline._debugfs_run_elevated
     _detect_game_via_debugfs = DirectSSDDecryptPipeline._detect_game_via_debugfs
 
 
