@@ -3286,7 +3286,10 @@ class StandaloneModPipeline(ModPipeline):
         native = getattr(self, '_native_debugfs_path', None)
         if native:
             # Native mode: run debugfs on host directly against raw device
-            args = [native]
+            args = []
+            if getattr(self, '_use_sudo', False):
+                args.append("sudo")
+            args.append(native)
             if writable:
                 args.append("-w")
             args.extend(["-R", command, self._wsl_img])
@@ -5376,16 +5379,48 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
 
                 self.log(f"Using native debugfs: {native_debugfs}", "info")
 
-                # Validate ext4
+                # Validate ext4 — debugfs may return exit 0 even on
+                # permission denied, so check the output text too
                 try:
-                    self._debugfs_run("stats", timeout=30)
-                    self.log("ext4 filesystem validated.", "success")
+                    stats_out = self._debugfs_run("stats", timeout=30)
                 except CommandError as e:
+                    stats_out = e.output or ""
+
+                if ('permission denied' in stats_out.lower()
+                        or 'filesystem not open' in stats_out.lower()):
+                    # Raw disk access needs root on macOS.  Use
+                    # osascript to prompt the user for their password
+                    # (standard macOS admin dialog), then cache sudo.
+                    self.log("Permission denied — requesting admin "
+                             "privileges...", "info")
+                    try:
+                        rc, _, stderr = self.executor.run_host(
+                            'osascript -e \'do shell script '
+                            '"sudo -v" with administrator privileges\'',
+                            timeout=120)
+                        if rc != 0:
+                            raise PipelineError("Mount",
+                                "Admin privileges are required for "
+                                "raw disk access.\n"
+                                "Please approve the password prompt "
+                                "and try again.")
+                        self._use_sudo = True
+                        self.log("Admin privileges granted.", "success")
+                        # Retry validation with sudo
+                        stats_out = self._debugfs_run(
+                            "stats", timeout=30)
+                    except PipelineError:
+                        raise
+                    except Exception as e:
+                        raise PipelineError("Mount",
+                            f"Could not obtain admin privileges: {e}"
+                        ) from e
+
+                if 'Filesystem features' not in stats_out:
                     raise PipelineError("Mount",
                         f"Cannot read ext4 filesystem on {raw_dev}:\n"
-                        f"{e.output}\n\n"
-                        f"If permission denied, try: "
-                        f"sudo python -m jjp_decryptor") from e
+                        f"{stats_out[:300]}")
+                self.log("ext4 filesystem validated.", "success")
 
                 # Detect game name via debugfs
                 self.game_name = self._detect_game_via_debugfs()
@@ -5525,12 +5560,16 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
 
                 # Validate ext4
                 try:
-                    self._debugfs_run("stats", timeout=30)
-                    self.log("ext4 image validated.", "success")
+                    stats_out = self._debugfs_run("stats", timeout=30)
                 except CommandError as e:
+                    stats_out = e.output or ""
+                if ('permission denied' in stats_out.lower()
+                        or 'filesystem not open' in stats_out.lower()
+                        or 'Filesystem features' not in stats_out):
                     raise PipelineError("Mount",
                         f"SSD image is not a valid ext4 filesystem: "
-                        f"{e.output}") from e
+                        f"{stats_out[:300]}")
+                self.log("ext4 image validated.", "success")
 
                 # Detect game name via debugfs
                 self.game_name = self._detect_game_via_debugfs()
@@ -5630,8 +5669,11 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                                 f"Running e2fsck on {device}s{p} to "
                                 f"commit journal...", "info")
                             try:
+                                e2fsck_cmd = [e2fsck, "-fy", raw]
+                                if getattr(self, '_use_sudo', False):
+                                    e2fsck_cmd = ["sudo"] + e2fsck_cmd
                                 result = subprocess.run(
-                                    [e2fsck, "-fy", raw],
+                                    e2fsck_cmd,
                                     capture_output=True, text=True,
                                     encoding='utf-8', errors='replace',
                                     timeout=300)
