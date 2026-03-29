@@ -5591,9 +5591,54 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                     self._disk_was_offlined = False
             elif isinstance(self.executor, DockerExecutor):
                 if getattr(self, '_native_debugfs_path', None):
-                    # Native debugfs mode: sync host filesystem and
-                    # eject the disk so macOS flushes all cached writes
                     device = getattr(self, 'device_path', None)
+
+                    # Run e2fsck on every partition we wrote to.
+                    # debugfs -w bypasses the ext4 journal; without
+                    # e2fsck the journal replay on next mount can
+                    # revert our changes.
+                    if device and getattr(self, '_succeeded', False):
+                        e2fsck = self._native_debugfs_path.replace(
+                            'debugfs', 'e2fsck')
+                        ab = getattr(self, '_ab_partitions', None)
+                        part_num = getattr(self, '_part_num',
+                                           config.GAME_PARTITION_NUMBER)
+                        parts_to_fsck = (
+                            ab if ab else [part_num])
+                        for p in parts_to_fsck:
+                            raw = device.replace(
+                                "/dev/disk", "/dev/rdisk") + f"s{p}"
+                            self.log(
+                                f"Running e2fsck on {device}s{p} to "
+                                f"commit journal...", "info")
+                            try:
+                                result = subprocess.run(
+                                    [e2fsck, "-fy", raw],
+                                    capture_output=True, text=True,
+                                    encoding='utf-8', errors='replace',
+                                    timeout=300)
+                                # e2fsck returns 1 if it fixed errors,
+                                # 0 if clean — both are OK
+                                if result.returncode <= 1:
+                                    self.log(
+                                        f"e2fsck {device}s{p}: OK",
+                                        "success")
+                                else:
+                                    self.log(
+                                        f"e2fsck {device}s{p} returned "
+                                        f"{result.returncode}: "
+                                        f"{result.stderr[:200]}",
+                                        "info")
+                            except FileNotFoundError:
+                                self.log(
+                                    f"e2fsck not found at {e2fsck} — "
+                                    f"skipping journal fix", "info")
+                            except Exception as e:
+                                self.log(
+                                    f"e2fsck {device}s{p} failed: {e}",
+                                    "info")
+
+                    # Sync and eject so macOS flushes all writes
                     try:
                         self.executor.run_host("sync", timeout=30)
                     except Exception:
