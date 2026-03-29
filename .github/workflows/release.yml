@@ -31,6 +31,11 @@ jobs:
             python generate_icon.py
           fi
 
+      - name: Stamp version from tag
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          python -c "import re,pathlib;p=pathlib.Path('jjp_decryptor/__init__.py');p.write_text(re.sub(r'__version__\s*=\s*\"[^\"]*\"','__version__ = \"'+'${VERSION}'+'\"',p.read_text()))"
+
       - name: Build DMG
         run: bash installer/build_macos.sh
 
@@ -62,6 +67,12 @@ jobs:
           if [ ! -f jjp_decryptor/icon.ico ]; then
             python generate_icon.py
           fi
+
+      - name: Stamp version from tag
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          python -c "import re,pathlib;p=pathlib.Path('jjp_decryptor/__init__.py');p.write_text(re.sub(r'__version__\s*=\s*\"[^\"]*\"','__version__ = \"'+'${VERSION}'+'\"',p.read_text()))"
 
       - name: Build installer
         shell: pwsh
@@ -97,6 +108,11 @@ jobs:
             python generate_icon.py
           fi
 
+      - name: Stamp version from tag
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          python -c "import re,pathlib;p=pathlib.Path('jjp_decryptor/__init__.py');p.write_text(re.sub(r'__version__\s*=\s*\"[^\"]*\"','__version__ = \"'+'${VERSION}'+'\"',p.read_text()))"
+
       - name: Build AppImage
         run: bash installer/build_linux.sh
 
@@ -123,6 +139,11 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stamp version from tag
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          python3 -c "import re,pathlib;p=pathlib.Path('jjp_decryptor/__init__.py');p.write_text(re.sub(r'__version__\s*=\s*\"[^\"]*\"','__version__ = \"'+'${VERSION}'+'\"',p.read_text()))"
 
       - name: Extract version from tag
         id: version
