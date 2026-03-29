@@ -4884,55 +4884,57 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
     def _detect_game_via_debugfs(self):
         """Detect game name on the SSD via debugfs.
 
-        Primary method: stat the game binary for each known game name.
+        Primary method: stat the edata directory for each known game.
         Fallback: parse ``ls -p`` output for unknown game directories.
         """
         # Fast path: check known game names directly via stat
+        # Check for edata dir (always present) and game binary
         for name in config.KNOWN_GAMES:
-            try:
-                stat_out = self._debugfs_run(
-                    f'stat "{config.GAME_BASE_PATH}/{name}/game"',
-                    timeout=10)
-                if 'Inode:' in stat_out or 'Type: regular' in stat_out:
-                    display = config.KNOWN_GAMES.get(name, name)
-                    self.log(f"Detected game: {display} ({name})",
-                             "success")
-                    return name
-            except CommandError:
-                pass
+            for target in ("edata", "game"):
+                try:
+                    stat_out = self._debugfs_run(
+                        f'stat "{config.GAME_BASE_PATH}/{name}/{target}"',
+                        timeout=10)
+                    # debugfs returns exit 0 even on failure; check for
+                    # success markers and absence of error messages
+                    if 'not found' in stat_out.lower():
+                        continue
+                    if ('Inode:' in stat_out or 'Type:' in stat_out
+                            or 'Size:' in stat_out):
+                        display = config.KNOWN_GAMES.get(name, name)
+                        self.log(f"Detected game: {display} ({name})",
+                                 "success")
+                        return name
+                except CommandError:
+                    pass
 
         # Fallback: list directory entries for unknown games
         try:
             output = self._debugfs_run(
                 f"ls -p {config.GAME_BASE_PATH}", timeout=15)
+            self.log(f"debugfs ls -p output: {output[:500]}", "info")
         except CommandError:
             return None
 
         # debugfs ls -p fields: /inode/mode/rec_len/name_len/name/
-        # Extract name from the second-to-last field (before trailing /)
         for line in output.splitlines():
             line = line.strip()
             if not line or not line.startswith('/'):
                 continue
-            # Split and grab the name field (second-to-last, before
-            # the trailing empty element from the final /)
             parts = line.split('/')
-            # Find name: last non-empty field
-            name = ''
-            for p in reversed(parts):
-                if p and p not in ('.', '..'):
-                    name = p
-                    break
-            if not name or name in ('.', '..'):
-                continue
-            # Skip entries that look like numbers (rec_len, etc.)
-            if name.isdigit():
+            # Name is second-to-last field (before trailing /)
+            name = parts[-2] if len(parts) >= 3 and parts[-1] == '' \
+                else parts[-1]
+            if not name or name in ('.', '..') or name.isdigit():
                 continue
             try:
                 stat_out = self._debugfs_run(
-                    f'stat "{config.GAME_BASE_PATH}/{name}/game"',
+                    f'stat "{config.GAME_BASE_PATH}/{name}/edata"',
                     timeout=10)
-                if 'Inode:' in stat_out or 'Type: regular' in stat_out:
+                if 'not found' in stat_out.lower():
+                    continue
+                if ('Inode:' in stat_out or 'Type:' in stat_out
+                        or 'Size:' in stat_out):
                     display = config.KNOWN_GAMES.get(name, name)
                     self.log(f"Detected game: {display} ({name})",
                              "success")
