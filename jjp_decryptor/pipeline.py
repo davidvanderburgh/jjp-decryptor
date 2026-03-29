@@ -5591,7 +5591,29 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                     self._disk_was_offlined = False
             elif isinstance(self.executor, DockerExecutor):
                 if getattr(self, '_native_debugfs_path', None):
-                    # Native debugfs mode: clean up local temp dir only
+                    # Native debugfs mode: sync host filesystem and
+                    # eject the disk so macOS flushes all cached writes
+                    device = getattr(self, 'device_path', None)
+                    try:
+                        self.executor.run_host("sync", timeout=30)
+                    except Exception:
+                        pass
+                    if device:
+                        try:
+                            rc, _, stderr = self.executor.run_host(
+                                f"diskutil eject {device}", timeout=30)
+                            if rc == 0:
+                                self.log(
+                                    f"Disk {device} ejected — safe to "
+                                    f"remove.", "success")
+                            else:
+                                self.log(
+                                    f"Warning: could not eject {device}: "
+                                    f"{stderr}", "info")
+                        except Exception:
+                            pass
+
+                    # Clean up local temp dir
                     if hasattr(self, '_debugfs_tmp') and \
                             os.path.isdir(self._debugfs_tmp):
                         import shutil as _shutil
