@@ -3112,6 +3112,83 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
 
         self.log("Cleanup complete.", "success")
 
+    # ---- debugfs helpers ----
+
+    def _debugfs_run(self, command, writable=False, timeout=120):
+        """Run a single debugfs command against the raw ext4 image.
+
+        Args:
+            command: debugfs command (e.g. 'ls /jjpe/gen1')
+            writable: open image read-write (-w flag)
+            timeout: seconds
+        Returns:
+            stdout string
+        """
+        native = getattr(self, '_native_debugfs_path', None)
+        if native:
+            # Native mode: run debugfs on host directly against raw device
+            if getattr(self, '_use_sudo', False):
+                return self._debugfs_run_elevated(
+                    command, writable=writable, timeout=timeout)
+            args = [native]
+            if writable:
+                args.append("-w")
+            args.extend(["-R", command, self._wsl_img])
+            try:
+                result = subprocess.run(
+                    args, capture_output=True, text=True,
+                    encoding='utf-8', errors='replace', timeout=timeout)
+            except subprocess.TimeoutExpired as e:
+                raise CommandError(
+                    f"debugfs -R '{command}'", -1,
+                    f"Timed out after {timeout}s") from e
+            output = (result.stdout or "") + (result.stderr or "")
+            if result.returncode != 0:
+                raise CommandError(
+                    f"debugfs -R '{command}'", result.returncode, output)
+            return output
+
+        w = "-w " if writable else ""
+        escaped = command.replace("'", "'\\''")
+        return self.executor.run(
+            f"debugfs {w}-R '{escaped}' '{self._wsl_img}' 2>&1",
+            timeout=timeout,
+        )
+
+    def _debugfs_run_elevated(self, command, writable=False, timeout=120):
+        """Run a debugfs command with macOS admin privileges via osascript.
+
+        Uses ``do shell script ... with administrator privileges`` which
+        invokes macOS Authorization Services.  The OS caches the grant
+        for ~5 minutes, so only the first call triggers a password dialog.
+        """
+        native = self._native_debugfs_path
+        w = "-w " if writable else ""
+        # Escape single quotes in the debugfs sub-command
+        escaped_cmd = command.replace("'", "'\\''")
+        # Build shell command; single-quote all path arguments
+        shell_cmd = (
+            f"'{native}' {w}-R '{escaped_cmd}' '{self._wsl_img}' 2>&1"
+        )
+        # Escape for AppleScript double-quoted string
+        as_cmd = shell_cmd.replace('\\', '\\\\').replace('"', '\\"')
+        try:
+            result = subprocess.run(
+                ["osascript", "-e",
+                 f'do shell script "{as_cmd}" '
+                 f'with administrator privileges'],
+                capture_output=True, text=True,
+                encoding='utf-8', errors='replace', timeout=timeout)
+        except subprocess.TimeoutExpired as e:
+            raise CommandError(
+                f"debugfs -R '{command}'", -1,
+                f"Timed out after {timeout}s") from e
+        output = (result.stdout or "") + (result.stderr or "")
+        if result.returncode != 0:
+            raise CommandError(
+                f"debugfs -R '{command}'", result.returncode, output)
+        return output
+
 
 class StandaloneModPipeline(ModPipeline):
     """Mod pipeline using pure Python crypto instead of dongle/chroot.
@@ -3270,87 +3347,6 @@ class StandaloneModPipeline(ModPipeline):
             self.on_phase(cleanup_phase)
             self._phase_cleanup_standalone()
             self.on_done(False, f"Unexpected error: {e}")
-
-    # ---- debugfs helpers ----
-
-    def _debugfs_run(self, command, writable=False, timeout=120):
-        """Run a single debugfs command against the raw ext4 image.
-
-        Args:
-            command: debugfs command (e.g. 'ls /jjpe/gen1')
-            writable: open image read-write (-w flag)
-            timeout: seconds
-        Returns:
-            stdout string
-        """
-        native = getattr(self, '_native_debugfs_path', None)
-        if native:
-            # Native mode: run debugfs on host directly against raw device
-            if getattr(self, '_use_sudo', False):
-                return self._debugfs_run_elevated(
-                    command, writable=writable, timeout=timeout)
-            args = [native]
-            if writable:
-                args.append("-w")
-            args.extend(["-R", command, self._wsl_img])
-            try:
-                result = subprocess.run(
-                    args, capture_output=True, text=True,
-                    encoding='utf-8', errors='replace', timeout=timeout)
-            except subprocess.TimeoutExpired as e:
-                raise CommandError(
-                    f"debugfs -R '{command}'", -1,
-                    f"Timed out after {timeout}s") from e
-            output = (result.stdout or "") + (result.stderr or "")
-            if result.returncode != 0:
-                raise CommandError(
-                    f"debugfs -R '{command}'", result.returncode, output)
-            return output
-
-        w = "-w " if writable else ""
-        # Use single quotes around the image path (may contain spaces
-        # on the WSL side, though unlikely for /var/tmp paths).
-        # The debugfs command itself is passed via -R with double quotes;
-        # internal paths use debugfs's own double-quote escaping.
-        escaped = command.replace("'", "'\\''")
-        return self.executor.run(
-            f"debugfs {w}-R '{escaped}' '{self._wsl_img}' 2>&1",
-            timeout=timeout,
-        )
-
-    def _debugfs_run_elevated(self, command, writable=False, timeout=120):
-        """Run a debugfs command with macOS admin privileges via osascript.
-
-        Uses ``do shell script ... with administrator privileges`` which
-        invokes macOS Authorization Services.  The OS caches the grant
-        for ~5 minutes, so only the first call triggers a password dialog.
-        """
-        native = self._native_debugfs_path
-        w = "-w " if writable else ""
-        # Escape single quotes in the debugfs sub-command
-        escaped_cmd = command.replace("'", "'\\''")
-        # Build shell command; single-quote all path arguments
-        shell_cmd = (
-            f"'{native}' {w}-R '{escaped_cmd}' '{self._wsl_img}' 2>&1"
-        )
-        # Escape for AppleScript double-quoted string
-        as_cmd = shell_cmd.replace('\\', '\\\\').replace('"', '\\"')
-        try:
-            result = subprocess.run(
-                ["osascript", "-e",
-                 f'do shell script "{as_cmd}" '
-                 f'with administrator privileges'],
-                capture_output=True, text=True,
-                encoding='utf-8', errors='replace', timeout=timeout)
-        except subprocess.TimeoutExpired as e:
-            raise CommandError(
-                f"debugfs -R '{command}'", -1,
-                f"Timed out after {timeout}s") from e
-        output = (result.stdout or "") + (result.stderr or "")
-        if result.returncode != 0:
-            raise CommandError(
-                f"debugfs -R '{command}'", result.returncode, output)
-        return output
 
     def _debugfs_dump_file(self, image_file_path, timeout=120):
         """Extract a file from the ext4 image via debugfs dump.
@@ -4677,9 +4673,6 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
         self._disk_was_offlined = False
         self._ssd_image_path = None    # raw image of SSD partition (macOS)
         self._needs_writeback = False   # write image back to SSD on success
-
-    # Reuse debugfs runner from StandaloneModPipeline
-    _debugfs_run = StandaloneModPipeline._debugfs_run
 
     def run(self):
         """Execute the direct SSD decrypt pipeline."""
