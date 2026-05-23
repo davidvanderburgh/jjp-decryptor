@@ -396,15 +396,26 @@ class App:
         threading.Thread(target=_run, daemon=True).start()
 
     def _check_for_update(self):
-        """Check GitHub for a newer release in a background thread."""
+        """Prompt the user to migrate to Pinball Asset Decryptor.
+
+        This standalone JJP app is no longer maintained — the
+        updater module now polls the unified Pinball Asset
+        Decryptor's release feed and surfaces a one-time prompt on
+        each launch.  See updater.py for why we no longer compare
+        versions.
+        """
         def _run():
             result = check_for_update(__version__)
             if result:
                 version, url = result
                 self.msg_queue.put(LogMsg(
-                    f"Update available: v{version}", "info"))
+                    "This app has been replaced by Pinball Asset "
+                    "Decryptor — a unified app covering JJP, BOF, "
+                    "Spooky, Pinball Brothers, Chicago Gaming, and "
+                    "Williams, with active development.", "info"))
                 self.msg_queue.put(LinkMsg(
-                    f"Download v{version}", url))
+                    f"Download Pinball Asset Decryptor v{version}",
+                    url))
 
         threading.Thread(target=_run, daemon=True).start()
 

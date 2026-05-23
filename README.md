@@ -1,4 +1,25 @@
-# JJP Asset Decryptor
+> # ⚠ Deprecated — use Pinball Asset Decryptor instead
+>
+> **This standalone JJP decryptor is no longer maintained.**
+> All JJP functionality — ISO Extract / Write / Mod Pack **and the
+> Direct-SSD flow** — now lives in the unified
+> [**Pinball Asset Decryptor**](https://github.com/davidvanderburgh/pinball-asset-decryptor),
+> alongside Barrels of Fun, Spooky Pinball, Pinball Brothers,
+> Chicago Gaming Company, and Williams support.
+>
+> New releases, new features (including a content-verifying
+> partition picker, A/B-mirror writes on Windows, and a manual
+> partition override), and bug fixes land **only** in the unified
+> repo from now on. The in-app updater will offer to take you
+> there next time you launch.
+>
+> **→ https://github.com/davidvanderburgh/pinball-asset-decryptor/releases**
+>
+> This repo is kept for historical reference.
+
+---
+
+# JJP Asset Decryptor (legacy)
 
 A cross-platform GUI application for decrypting and modifying game assets on Jersey Jack Pinball (JJP) machines. Runs on Windows, macOS, and Linux. The encryption algorithm has been fully reverse-engineered — **no USB dongle required**. Turns a complex multi-step process involving filesystem extraction, cryptographic decryption, and ISO rebuilding into a single button click.
 
