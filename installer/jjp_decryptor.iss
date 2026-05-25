@@ -63,6 +63,7 @@ Source: "{#ProjectDir}\jjp_decryptor\updater.py"; DestDir: "{app}\jjp_decryptor"
 Source: "{#ProjectDir}\jjp_decryptor\crypto.py"; DestDir: "{app}\jjp_decryptor"; Flags: ignoreversion
 Source: "{#ProjectDir}\jjp_decryptor\filelist.py"; DestDir: "{app}\jjp_decryptor"; Flags: ignoreversion
 Source: "{#ProjectDir}\jjp_decryptor\audio.py"; DestDir: "{app}\jjp_decryptor"; Flags: ignoreversion
+Source: "{#ProjectDir}\jjp_decryptor\deprecation_banner.py"; DestDir: "{app}\jjp_decryptor"; Flags: ignoreversion
 Source: "{#ProjectDir}\jjp_decryptor\icon.ico"; DestDir: "{app}\jjp_decryptor"; Flags: ignoreversion
 
 ; Entry point and launcher
