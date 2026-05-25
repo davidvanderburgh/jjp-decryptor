@@ -367,6 +367,16 @@ class MainWindow:
         main = ttk.Frame(self.root, padding=8)
         main.pack(fill=tk.BOTH, expand=True)
 
+        # Deprecation banner — packed at the very top so it's the
+        # first thing the eye lands on.  This standalone JJP build
+        # is no longer maintained; everything moved to the unified
+        # Pinball Asset Decryptor.  Non-modal: the app stays fully
+        # usable for anyone mid-workflow.
+        from .deprecation_banner import build_deprecation_banner
+        self._deprecation_banner = build_deprecation_banner(
+            main, app_name="JJP Asset Decryptor")
+        self._deprecation_banner.pack(fill=tk.X, pady=(0, 8))
+
         # Top bar with icon buttons (right-aligned)
         top_bar = ttk.Frame(main)
         top_bar.pack(fill=tk.X, pady=(0, 2))
